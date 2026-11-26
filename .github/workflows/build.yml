@@ -22,7 +22,7 @@ jobs:
       - name: Install QEMU & Optional UPX
         run: |
           sudo apt-get update
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends qemu-user-static
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends qemu-user
           if [ "${{ inputs.use_upx }}" = "true" ]; then
             UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
             UPX_VER=${UPX_TAG#v}
@@ -76,9 +76,9 @@ jobs:
           done
 
           # 模拟 ARM64 真机指令集校验可执行性与版本号
-          qemu-aarch64-static ./out/xray version | sed -n '1p' > meta/ver_xray
-          qemu-aarch64-static ./out/frpc -v > meta/ver_frpc
-          qemu-aarch64-static ./out/cloudflared -v > meta/ver_cloudflared
+          qemu-aarch64 ./out/xray version | sed -n '1p' > meta/ver_xray
+          qemu-aarch64 ./out/frpc -v > meta/ver_frpc
+          qemu-aarch64 ./out/cloudflared -v > meta/ver_cloudflared
 
           if [ "${{ inputs.use_upx }}" = "true" ]; then
             upx --best --lzma out/xray out/frpc out/cloudflared
