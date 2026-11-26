@@ -1,15 +1,10 @@
-name: Build Mini Router Binaries (ARM64)
+name: Build & Test ARM64 Binaries (Raw vs UPX)
 
 on:
   workflow_dispatch:
-    inputs:
-      use_upx:
-        description: '启用 UPX 极限压缩（取消勾选则保留未压缩原版）'
-        type: boolean
-        default: false
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -19,66 +14,153 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Install Latest UPX
-        if: ${{ inputs.use_upx }}
+      - name: Install QEMU (ARM64) & Latest UPX
         run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
           UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
           UPX_VER=${UPX_TAG#v}
           curl -fsSL "https://github.com/upx/upx/releases/download/${UPX_TAG}/upx-${UPX_VER}-amd64_linux.tar.xz" | tar -xJ
           sudo mv "upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
           upx --version
+          qemu-aarch64-static --version
 
-      - name: Build Xray (arm64)
+      - name: Build Xray (Latest Release, arm64)
         run: |
-          mkdir -p out
+          mkdir -p out-raw
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-          echo "Building Xray ${TAG}..."
+          echo "XRAY_TAG=${TAG}" >> "$GITHUB_ENV"
           git clone --depth 1 --branch "${TAG}" https://github.com/XTLS/Xray-core.git
           cd Xray-core
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
-            go build -trimpath -ldflags="-s -w -buildid=" -o ../out/xray ./main
+            go build -trimpath -ldflags="-s -w -buildid=" -o ../out-raw/xray ./main
 
-      - name: Build frpc (arm64, no-web)
+      - name: Build frpc (Latest Release, arm64, no-web)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
-          echo "Building frpc ${TAG}..."
+          echo "FRPC_TAG=${TAG}" >> "$GITHUB_ENV"
           git clone --depth 1 --branch "${TAG}" https://github.com/fatedier/frp.git
           cd frp
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
-            go build -trimpath -tags "frpc,noweb" -ldflags="-s -w -buildid=" -o ../out/frpc ./cmd/frpc
+            go build -trimpath -tags "frpc,noweb" -ldflags="-s -w -buildid=" -o ../out-raw/frpc ./cmd/frpc
 
-      - name: Build cloudflared (arm64)
+      - name: Build cloudflared (Latest Release, arm64)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
-          echo "Building cloudflared ${TAG}..."
+          echo "CF_TAG=${TAG}" >> "$GITHUB_ENV"
           git clone --depth 1 --branch "${TAG}" https://github.com/cloudflare/cloudflared.git
           cd cloudflared
           BUILD_DATE=$(date -u '+%Y-%m-%d-%H:%M UTC')
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto GOFIPS140=off \
             go build -trimpath \
             -ldflags="-s -w -buildid= -X 'main.Version=${TAG}' -X 'main.BuildTime=${BUILD_DATE}'" \
-            -o ../out/cloudflared ./cmd/cloudflared
+            -o ../out-raw/cloudflared ./cmd/cloudflared
 
-      - name: Compress with UPX
-        if: ${{ inputs.use_upx }}
+      - name: Compress Copy with UPX
         run: |
-          upx --best --lzma out/xray out/frpc out/cloudflared
+          mkdir -p out-upx
+          cp -a out-raw/. out-upx/
+          for f in xray frpc cloudflared; do
+            echo ">>> 正在压缩 $f ..."
+            if ! upx --best --lzma "out-upx/$f"; then
+              echo "::warning::$f UPX 压缩失败"
+              rm -f "out-upx/$f"
+            fi
+          done
 
-      - name: Output Size Summary
+      - name: Run Functional Tests (Raw & UPX via QEMU ARM64)
         run: |
+          cat << 'EOF' > /tmp/test_xray.json
           {
-            echo "### 编译结果（UPX 压缩：\`${{ inputs.use_upx }}\`）"
+            "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks"}],
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/test_frpc.toml
+          serverAddr = "127.0.0.1"
+          serverPort = 7000
+
+          [[proxies]]
+          name = "test-ssh"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 22
+          remotePort = 6000
+          EOF
+
+          cat << 'EOF' > /tmp/test_cf.yml
+          ingress:
+            - hostname: test.example.com
+              service: http://127.0.0.1:8080
+            - service: http_status:404
+          EOF
+
+          run_suite() {
+            local DIR="$1"
+            local PREFIX="$2"
+            local R_XRAY="❌ 失败"
+            local R_FRPC="❌ 失败"
+            local R_CF="❌ 失败"
+
+            echo "========== 测试 ${PREFIX} =========="
+            if [ -x "${DIR}/xray" ] && \
+               qemu-aarch64-static "${DIR}/xray" version && \
+               qemu-aarch64-static "${DIR}/xray" uuid && \
+               qemu-aarch64-static "${DIR}/xray" run -test -c /tmp/test_xray.json; then
+              R_XRAY="✅ 通过"
+            fi
+
+            if [ -x "${DIR}/frpc" ] && \
+               qemu-aarch64-static "${DIR}/frpc" -v && \
+               qemu-aarch64-static "${DIR}/frpc" verify -c /tmp/test_frpc.toml; then
+              R_FRPC="✅ 通过"
+            fi
+
+            if [ -x "${DIR}/cloudflared" ] && \
+               qemu-aarch64-static "${DIR}/cloudflared" --version && \
+               qemu-aarch64-static "${DIR}/cloudflared" tunnel --config /tmp/test_cf.yml ingress validate; then
+              R_CF="✅ 通过"
+            fi
+
+            echo "${PREFIX}_XRAY=${R_XRAY}" >> /tmp/test_results.env
+            echo "${PREFIX}_FRPC=${R_FRPC}" >> /tmp/test_results.env
+            echo "${PREFIX}_CF=${R_CF}" >> /tmp/test_results.env
+          }
+
+          : > /tmp/test_results.env
+          run_suite "out-raw" "RAW"
+          run_suite "out-upx" "UPX"
+
+          source /tmp/test_results.env
+          get_size() { [ -f "$1" ] && ls -lh "$1" | awk '{print $5}' || echo "无文件"; }
+
+          {
+            echo "### ARM64 编译与功能测试对比报告"
             echo ""
-            echo "| 程序 | 最终体积 |"
-            echo "| :--- | :--- |"
-            for f in xray frpc cloudflared; do
-              SIZE=$(ls -lh "out/$f" | awk '{print $5}')
-              echo "| \`$f\` | **${SIZE}** |"
-            done
+            echo "| 程序 | 最新正式版 | 未压缩体积 | 未压缩测试 | UPX 体积 | UPX 测试 |"
+            echo "| :--- | :--- | :--- | :--- | :--- | :--- |"
+            echo "| \`xray\` | \`${XRAY_TAG}\` | $(get_size out-raw/xray) | ${RAW_XRAY} | $(get_size out-upx/xray) | ${UPX_XRAY} |"
+            echo "| \`frpc\` | \`${FRPC_TAG}\` | $(get_size out-raw/frpc) | ${RAW_FRPC} | $(get_size out-upx/frpc) | ${UPX_FRPC} |"
+            echo "| \`cloudflared\` | \`${CF_TAG}\` | $(get_size out-raw/cloudflared) | ${RAW_CF} | $(get_size out-upx/cloudflared) | ${UPX_CF} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload Binaries
+          # 若有任意未压缩版本失败则标红提醒
+          if [[ "${RAW_XRAY}" != "✅ 通过" || "${RAW_FRPC}" != "✅ 通过" || "${RAW_CF}" != "✅ 通过" ]]; then
+            echo "::error::未压缩版本存在功能测试失败，请展开日志检查"
+            exit 1
+          fi
+
+      - name: Upload Uncompressed Binaries
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arm64-binaries-${{ inputs.use_upx && 'upx' || 'no-upx' }}
-          path: out/
+          name: arm64-raw-uncompressed
+          path: out-raw/
+
+      - name: Upload UPX Binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-upx-compressed
+          path: out-upx/
