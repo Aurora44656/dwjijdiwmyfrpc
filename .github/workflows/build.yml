@@ -190,9 +190,9 @@ jobs:
               R_CF="✅ 通过"
             fi
 
-            echo "${PREFIX}_XRAY=${R_XRAY}" >> /tmp/test_results.env
-            echo "${PREFIX}_FRPC=${R_FRPC}" >> /tmp/test_results.env
-            echo "${PREFIX}_CF=${R_CF}" >> /tmp/test_results.env
+            echo "${PREFIX}_XRAY=\"${R_XRAY}\"" >> /tmp/test_results.env
+            echo "${PREFIX}_FRPC=\"${R_FRPC}\"" >> /tmp/test_results.env
+            echo "${PREFIX}_CF=\"${R_CF}\"" >> /tmp/test_results.env
           }
 
           : > /tmp/test_results.env
