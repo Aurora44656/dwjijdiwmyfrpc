@@ -1,4 +1,4 @@
-name: Build & Test ARM64 Binaries (Raw vs UPX)
+name: Build & Test Slim ARM64 Binaries
 
 on:
   workflow_dispatch:
@@ -17,23 +17,43 @@ jobs:
       - name: Install QEMU (ARM64) & Latest UPX
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          sudo apt-get install -y qemu-user
+          QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static)
+          echo "QEMU_BIN=${QEMU_BIN}" >> "$GITHUB_ENV"
+          "${QEMU_BIN}" --version
+
           UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
           UPX_VER=${UPX_TAG#v}
           curl -fsSL "https://github.com/upx/upx/releases/download/${UPX_TAG}/upx-${UPX_VER}-amd64_linux.tar.xz" | tar -xJ
           sudo mv "upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
           upx --version
-          qemu-aarch64-static --version
 
-      - name: Build Xray (Latest Release, arm64)
+      - name: Build Slim Xray (VLESS/VMess Inbound + WS/XHTTP + Freedom)
         run: |
           mkdir -p out-raw
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
           echo "XRAY_TAG=${TAG}" >> "$GITHUB_ENV"
           git clone --depth 1 --branch "${TAG}" https://github.com/XTLS/Xray-core.git
           cd Xray-core
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
-            go build -trimpath -ldflags="-s -w -buildid=" -o ../out-raw/xray ./main
+
+          # 1. 裁剪 all.go 中未使用的协议、传输层与管理服务
+          sed -i -E 's|^([[:space:]]*_[[:space:]]+".*(proxy/(wireguard|shadowsocks|trojan|socks|http|dokodemo|dns|loopback|hysteria|tun|vless/outbound|vmess/outbound)|transport/internet/(grpc|kcp|httpupgrade|reality|headers/)|app/(commander|observatory|reverse|metrics|dns/fakedns)|/command|main/(toml|yaml))")|// \1|' main/distro/all/all.go
+
+          echo "=== 已裁剪的模块 ==="
+          git diff main/distro/all/all.go || true
+
+          # 2. 移除依赖 gRPC 的 api 子命令（若新版源码结构变化则自动回退）
+          if grep -q 'main/commands/all/api' main/commands/all/commands.go 2>/dev/null; then
+            sed -i '/main\/commands\/all\/api/d; /api\.CmdAPI/d' main/commands/all/commands.go
+          fi
+
+          if ! CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
+            go build -trimpath -ldflags="-s -w -buildid=" -o ../out-raw/xray ./main; then
+            echo "::warning::移除 api 子命令失败，回退 commands.go 后重试编译"
+            git checkout -- main/commands/all/commands.go
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
+              go build -trimpath -ldflags="-s -w -buildid=" -o ../out-raw/xray ./main
+          fi
 
       - name: Build frpc (Latest Release, arm64, no-web)
         run: |
@@ -70,17 +90,64 @@ jobs:
 
       - name: Run Functional Tests (Raw & UPX via QEMU ARM64)
         run: |
-          cat << 'EOF' > /tmp/test_xray.json
+          cat << 'EOF' > /tmp/test_xray_dual.json
           {
-            "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks"}],
-            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": 10001,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "11111111-1111-1111-1111-111111111111"}],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/test", "mode": "auto"}
+              }
+            }],
+            "outbounds": [{
+              "protocol": "freedom",
+              "settings": {
+                "finalRules": [{
+                  "action": "allow",
+                  "network": "tcp,udp",
+                  "ip": ["10.0.0.0/8", "172.16.0.0/12", "fc00::/7", "::1/128"]
+                }]
+              }
+            }]
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/test_xray_single.json
+          {
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": 10002,
+              "protocol": "vmess",
+              "settings": {
+                "clients": [{"id": "11111111-1111-1111-1111-111111111111", "alterId": 0}]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "/test"}
+              }
+            }],
+            "outbounds": [{
+              "protocol": "freedom",
+              "settings": {
+                "finalRules": [{
+                  "action": "allow",
+                  "network": "tcp,udp",
+                  "ip": ["10.0.0.0/8", "172.16.0.0/12", "fc00::/7", "::1/128"]
+                }]
+              }
+            }]
           }
           EOF
 
           cat << 'EOF' > /tmp/test_frpc.toml
           serverAddr = "127.0.0.1"
           serverPort = 7000
-
           [[proxies]]
           name = "test-ssh"
           type = "tcp"
@@ -105,21 +172,21 @@ jobs:
 
             echo "========== 测试 ${PREFIX} =========="
             if [ -x "${DIR}/xray" ] && \
-               qemu-aarch64-static "${DIR}/xray" version && \
-               qemu-aarch64-static "${DIR}/xray" uuid && \
-               qemu-aarch64-static "${DIR}/xray" run -test -c /tmp/test_xray.json; then
+               "${QEMU_BIN}" "${DIR}/xray" version && \
+               "${QEMU_BIN}" "${DIR}/xray" run -test -c /tmp/test_xray_dual.json && \
+               "${QEMU_BIN}" "${DIR}/xray" run -test -c /tmp/test_xray_single.json; then
               R_XRAY="✅ 通过"
             fi
 
             if [ -x "${DIR}/frpc" ] && \
-               qemu-aarch64-static "${DIR}/frpc" -v && \
-               qemu-aarch64-static "${DIR}/frpc" verify -c /tmp/test_frpc.toml; then
+               "${QEMU_BIN}" "${DIR}/frpc" -v && \
+               "${QEMU_BIN}" "${DIR}/frpc" verify -c /tmp/test_frpc.toml; then
               R_FRPC="✅ 通过"
             fi
 
             if [ -x "${DIR}/cloudflared" ] && \
-               qemu-aarch64-static "${DIR}/cloudflared" --version && \
-               qemu-aarch64-static "${DIR}/cloudflared" tunnel --config /tmp/test_cf.yml ingress validate; then
+               "${QEMU_BIN}" "${DIR}/cloudflared" --version && \
+               "${QEMU_BIN}" "${DIR}/cloudflared" tunnel --config /tmp/test_cf.yml ingress validate; then
               R_CF="✅ 通过"
             fi
 
@@ -136,16 +203,15 @@ jobs:
           get_size() { [ -f "$1" ] && ls -lh "$1" | awk '{print $5}' || echo "无文件"; }
 
           {
-            echo "### ARM64 编译与功能测试对比报告"
+            echo "### ARM64 裁剪编译与功能测试对比报告"
             echo ""
             echo "| 程序 | 最新正式版 | 未压缩体积 | 未压缩测试 | UPX 体积 | UPX 测试 |"
             echo "| :--- | :--- | :--- | :--- | :--- | :--- |"
-            echo "| \`xray\` | \`${XRAY_TAG}\` | $(get_size out-raw/xray) | ${RAW_XRAY} | $(get_size out-upx/xray) | ${UPX_XRAY} |"
-            echo "| \`frpc\` | \`${FRPC_TAG}\` | $(get_size out-raw/frpc) | ${RAW_FRPC} | $(get_size out-upx/frpc) | ${UPX_FRPC} |"
+            echo "| \`xray\` (精简版) | \`${XRAY_TAG}\` | $(get_size out-raw/xray) | ${RAW_XRAY} | $(get_size out-upx/xray) | ${UPX_XRAY} |"
+            echo "| \`frpc\` (无Web) | \`${FRPC_TAG}\` | $(get_size out-raw/frpc) | ${RAW_FRPC} | $(get_size out-upx/frpc) | ${UPX_FRPC} |"
             echo "| \`cloudflared\` | \`${CF_TAG}\` | $(get_size out-raw/cloudflared) | ${RAW_CF} | $(get_size out-upx/cloudflared) | ${UPX_CF} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # 若有任意未压缩版本失败则标红提醒
           if [[ "${RAW_XRAY}" != "✅ 通过" || "${RAW_FRPC}" != "✅ 通过" || "${RAW_CF}" != "✅ 通过" ]]; then
             echo "::error::未压缩版本存在功能测试失败，请展开日志检查"
             exit 1
