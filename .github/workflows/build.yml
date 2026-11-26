@@ -37,7 +37,7 @@ jobs:
           cd Xray-core
 
           # 1. 裁剪 all.go 中未使用的协议、传输层与管理服务
-          sed -i -E 's|^([[:space:]]*_[[:space:]]+".*(proxy/(wireguard|shadowsocks|trojan|socks|http|dokodemo|dns|loopback|hysteria|tun|vless/outbound|vmess/outbound)|transport/internet/(grpc|kcp|httpupgrade|reality|headers/)|app/(commander|observatory|reverse|metrics|dns/fakedns)|/command|main/(toml|yaml))")|// \1|' main/distro/all/all.go
+          sed -i -E 's#^([[:space:]]*_[[:space:]]+".*(proxy/(wireguard|shadowsocks|trojan|socks|http|dokodemo|dns|loopback|hysteria|tun|vless/outbound|vmess/outbound)|transport/internet/(grpc|kcp|httpupgrade|reality|headers/)|app/(commander|observatory|reverse|metrics|dns/fakedns)|/command|main/(toml|yaml))")#// \1#' main/distro/all/all.go
 
           echo "=== 已裁剪的模块 ==="
           git diff main/distro/all/all.go || true
