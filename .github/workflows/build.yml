@@ -1,0 +1,84 @@
+name: Build Mini Router Binaries (ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_upx:
+        description: '启用 UPX 极限压缩（取消勾选则保留未压缩原版）'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install Latest UPX
+        if: ${{ inputs.use_upx }}
+        run: |
+          UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
+          UPX_VER=${UPX_TAG#v}
+          curl -fsSL "https://github.com/upx/upx/releases/download/${UPX_TAG}/upx-${UPX_VER}-amd64_linux.tar.xz" | tar -xJ
+          sudo mv "upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version
+
+      - name: Build Xray (arm64)
+        run: |
+          mkdir -p out
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          echo "Building Xray ${TAG}..."
+          git clone --depth 1 --branch "${TAG}" https://github.com/XTLS/Xray-core.git
+          cd Xray-core
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
+            go build -trimpath -ldflags="-s -w -buildid=" -o ../out/xray ./main
+
+      - name: Build frpc (arm64, no-web)
+        run: |
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+          echo "Building frpc ${TAG}..."
+          git clone --depth 1 --branch "${TAG}" https://github.com/fatedier/frp.git
+          cd frp
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto \
+            go build -trimpath -tags "frpc,noweb" -ldflags="-s -w -buildid=" -o ../out/frpc ./cmd/frpc
+
+      - name: Build cloudflared (arm64)
+        run: |
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
+          echo "Building cloudflared ${TAG}..."
+          git clone --depth 1 --branch "${TAG}" https://github.com/cloudflare/cloudflared.git
+          cd cloudflared
+          BUILD_DATE=$(date -u '+%Y-%m-%d-%H:%M UTC')
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOTOOLCHAIN=auto GOFIPS140=off \
+            go build -trimpath \
+            -ldflags="-s -w -buildid= -X 'main.Version=${TAG}' -X 'main.BuildTime=${BUILD_DATE}'" \
+            -o ../out/cloudflared ./cmd/cloudflared
+
+      - name: Compress with UPX
+        if: ${{ inputs.use_upx }}
+        run: |
+          upx --best --lzma out/xray out/frpc out/cloudflared
+
+      - name: Output Size Summary
+        run: |
+          {
+            echo "### 编译结果（UPX 压缩：\`${{ inputs.use_upx }}\`）"
+            echo ""
+            echo "| 程序 | 最终体积 |"
+            echo "| :--- | :--- |"
+            for f in xray frpc cloudflared; do
+              SIZE=$(ls -lh "out/$f" | awk '{print $5}')
+              echo "| \`$f\` | **${SIZE}** |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-binaries-${{ inputs.use_upx && 'upx' || 'no-upx' }}
+          path: out/
