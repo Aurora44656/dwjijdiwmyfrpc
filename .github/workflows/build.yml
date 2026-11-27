@@ -90,13 +90,15 @@ jobs:
               CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
               COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
 
-              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
+              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + gcc-ar LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
               git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
               cmake -S /tmp/json-c -B /tmp/json-c/build \
                 -DCMAKE_BUILD_TYPE=MinSizeRel \
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
                 -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                 -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                 -DBUILD_SHARED_LIBS=OFF \
@@ -119,6 +121,7 @@ jobs:
                   --libdir=lib \
                   --openssldir=/etc/ssl \
                   no-shared no-dso no-engine no-async no-tests no-ui-console no-err \
+                  no-autoload-config no-autoerrinit no-tls1 no-tls1_1 no-tls1-method no-tls1_1-method \
                   no-aria no-bf no-blake2 no-camellia no-cast no-cmac no-cms no-comp \
                   no-ct no-des no-dh no-dsa no-dtls no-ec2m no-filenames no-gost \
                   no-heartbeats no-idea no-md2 no-md4 no-mdc2 no-multiblock \
@@ -131,12 +134,13 @@ jobs:
                 sed -i "s/-O3/-Os/g; s/-DECP_NISTZ256_ASM//g" Makefile
                 grep -q -- "-ffunction-sections" Makefile
 
-                # 从全局注册表中剔除 xfrpc 绝不会用到的 Curve448(X448/Ed448 210KB 预计算表)、SHA-3/Keccak1600 及冷门 AES 模式
-                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/ameth_lib.c crypto/evp/pmeth_lib.c
+                # 从全局注册表中剔除 Curve448(X448/Ed448 210KB 预计算表，注意 ASN.1 表位于 standard_methods.h)、SHA-3/Keccak1600 及冷门 AES 模式
+                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
+                ! grep -Eq "ecx448_|ed448_" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
                 sed -i "/EVP_sha3_/d; /EVP_shake/d; /EVP_sha512_/d" crypto/evp/c_alld.c
                 sed -i "/_cbc_hmac_/d; /_ccm/d; /_xts/d; /_wrap/d; /_cfb1(/d; /_cfb8(/d; /_ofb/d; /_ecb/d; /aes_192/d" crypto/evp/c_allc.c
 
-                make -j"$(nproc)" build_libs
+                make -j"$(nproc)" build_libs AR="gcc-ar" RANLIB="gcc-ranlib"
                 make install_dev
 
                 git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
@@ -145,6 +149,8 @@ jobs:
                   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                   -DCMAKE_INSTALL_PREFIX=/usr \
                   -DCMAKE_INSTALL_LIBDIR=lib \
+                  -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                  -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
                   -DCMAKE_C_FLAGS="${CFLAGS_OPT} ${COMPAT_CFLAGS}" \
                   -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                   -DEVENT__LIBRARY_TYPE=STATIC \
@@ -171,10 +177,12 @@ jobs:
               cmake -B build \
                 -DCMAKE_BUILD_TYPE=MinSizeRel \
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
                 -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                 -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                 -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,-s" \
+                -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -fuse-linker-plugin -Wl,--gc-sections -Wl,-s" \
                 -DOPENSSL_USE_STATIC_LIBS=ON \
                 -DUSE_WOLFSSL=OFF \
                 -DENABLE_QUIC=OFF \
