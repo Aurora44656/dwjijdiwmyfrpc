@@ -87,10 +87,10 @@ jobs:
                 build-base cmake pkgconfig git perl linux-headers \
                 zlib-dev zlib-static
 
-              CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -march=armv8-a+crc+crypto -mtune=cortex-a53"
+              CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
               COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
 
-              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
+              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
               git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
               cmake -S /tmp/json-c -B /tmp/json-c/build \
                 -DCMAKE_BUILD_TYPE=MinSizeRel \
@@ -109,23 +109,33 @@ jobs:
               cmake --install /tmp/json-c/build
 
               # 2. xfrpc 5.x 已全量硬编码使用 OpenSSL 原生 API（USE_WOLFSSL 在非 QUIC 下已失效且会导致双库同时链接）
-              #    slim 模式：从源码编译极限裁剪的 OpenSSL 1.1.1w + libevent，彻底避开 OpenSSL 3.x Default Provider 全局分发表引发的 5MB+ 膨胀
+              #    slim 模式：从源码编译极限裁剪的 OpenSSL 1.1.1w + libevent
+              #    注意：OpenSSL 1.1.1 的 ./Configure 会忽略环境变量 CFLAGS，必须将 CFLAGS_OPT 作为位置参数直接传在命令行末尾！
               if [ "${XFRPC_TLS}" = "slim" ] || [ "${XFRPC_TLS}" = "wolfssl" ]; then
                 git clone --depth 1 --branch OpenSSL_1_1_1w https://github.com/openssl/openssl.git /tmp/openssl
                 cd /tmp/openssl
-                CFLAGS="${CFLAGS_OPT} ${COMPAT_CFLAGS}" \
                 ./Configure linux-aarch64 \
                   --prefix=/usr \
                   --libdir=lib \
                   --openssldir=/etc/ssl \
                   no-shared no-dso no-engine no-async no-tests no-ui-console no-err \
                   no-aria no-bf no-blake2 no-camellia no-cast no-cmac no-cms no-comp \
-                  no-ct no-des no-dsa no-dtls no-ec2m no-filenames no-gost \
+                  no-ct no-des no-dh no-dsa no-dtls no-ec2m no-filenames no-gost \
                   no-heartbeats no-idea no-md2 no-md4 no-mdc2 no-multiblock \
-                  no-nextprotoneg no-ocsp no-psk no-rc2 no-rc4 no-rc5 no-rdrand \
+                  no-nextprotoneg no-ocb no-ocsp no-psk no-rc2 no-rc4 no-rc5 no-rdrand \
                   no-rfc3779 no-rmd160 no-scrypt no-seed no-siphash no-sm2 no-sm3 \
-                  no-sm4 no-srp no-srtp no-ssl3 no-ts no-whirlpool
-                sed -i "s/-O3/-Os/g" Makefile
+                  no-sm4 no-srp no-srtp no-ssl3 no-ts no-whirlpool \
+                  ${CFLAGS_OPT} ${COMPAT_CFLAGS}
+
+                # 剔除 Makefile 中的 -O3 与 187KB 的 P-256 巨型预计算表 (ECP_NISTZ256_ASM)，并校验 section GC 标志已生效
+                sed -i "s/-O3/-Os/g; s/-DECP_NISTZ256_ASM//g" Makefile
+                grep -q -- "-ffunction-sections" Makefile
+
+                # 从全局注册表中剔除 xfrpc 绝不会用到的 Curve448(X448/Ed448 210KB 预计算表)、SHA-3/Keccak1600 及冷门 AES 模式
+                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/ameth_lib.c crypto/evp/pmeth_lib.c
+                sed -i "/EVP_sha3_/d; /EVP_shake/d; /EVP_sha512_/d" crypto/evp/c_alld.c
+                sed -i "/_cbc_hmac_/d; /_ccm/d; /_xts/d; /_wrap/d; /_cfb1(/d; /_cfb8(/d; /_ofb/d; /_ecb/d; /aes_192/d" crypto/evp/c_allc.c
+
                 make -j"$(nproc)" build_libs
                 make install_dev
 
@@ -152,10 +162,10 @@ jobs:
                   openssl-dev openssl-libs-static
               fi
 
-              # 3. 编译 xfrpc：修正 CMakeLists.txt 强制追加 -O2 及静态库依赖顺序倒置问题，配合 --gc-sections 消除死代码
+              # 3. 编译 xfrpc：修正 CMakeLists.txt 强制追加 -O2/-Werror 及静态库依赖顺序倒置问题，启用全程序 LTO + --gc-sections
               git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
               cd /tmp/xfrpc
-              sed -i "s/-O2/-Os/g" CMakeLists.txt
+              sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
               sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
 
               cmake -B build \
@@ -164,7 +174,7 @@ jobs:
                 -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                 -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                 -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--gc-sections -Wl,-s" \
+                -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,-s" \
                 -DOPENSSL_USE_STATIC_LIBS=ON \
                 -DUSE_WOLFSSL=OFF \
                 -DENABLE_QUIC=OFF \
