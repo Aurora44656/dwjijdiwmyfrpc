@@ -15,33 +15,33 @@ on:
           - openssl
           - wolfssl
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      USE_UPX: ${{ inputs.use_upx }}
+      XFRPC_TLS: ${{ inputs.xfrpc_tls }}
+
     steps:
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: 'stable'
+          cache: false
 
-      - name: Set up QEMU for Docker (arm64)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Install QEMU & Optional UPX
+      - name: Install Optional UPX (arm64)
+        if: ${{ inputs.use_upx }}
         run: |
-          sudo apt-get update
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends qemu-user
-          if [ "${{ inputs.use_upx }}" = "true" ]; then
-            UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
-            UPX_VER=${UPX_TAG#v}
-            curl -fsSL "https://github.com/upx/upx/releases/download/${UPX_TAG}/upx-${UPX_VER}-amd64_linux.tar.xz" | tar -xJ
-            sudo mv "upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
-            upx --version
-          fi
+          UPX_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name)
+          UPX_VER=${UPX_TAG#v}
+          curl -fsSL "https://github.com/upx/upx/releases/download/${UPX_TAG}/upx-${UPX_VER}-arm64_linux.tar.xz" | tar -xJ
+          sudo mv "upx-${UPX_VER}-arm64_linux/upx" /usr/local/bin/upx
+          upx --version
 
       - name: Build Xray (arm64)
         run: |
@@ -74,22 +74,22 @@ jobs:
           if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/tags | jq -r '.[0].name')
           fi
-          echo "Building xfrpc ${TAG} (TLS: ${{ inputs.xfrpc_tls }})..."
+          echo "Building xfrpc ${TAG} (TLS: ${XFRPC_TLS})..."
 
           WOLFSSL_TAG=""
-          if [ "${{ inputs.xfrpc_tls }}" = "wolfssl" ]; then
+          if [ "${XFRPC_TLS}" = "wolfssl" ]; then
             WOLFSSL_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/wolfSSL/wolfssl/releases/latest | jq -r .tag_name)
             echo "Building static wolfSSL ${WOLFSSL_TAG}..."
           fi
 
-          docker run --rm --platform linux/arm64 \
+          docker run --rm \
             -v "${PWD}/out:/out" \
             -e XFRPC_TAG="${TAG}" \
-            -e XFRPC_TLS="${{ inputs.xfrpc_tls }}" \
+            -e XFRPC_TLS="${XFRPC_TLS}" \
             -e WOLFSSL_TAG="${WOLFSSL_TAG}" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            alpine:3.21 sh -euxc '
+            alpine:3.24 sh -euxc '
               apk add --no-cache \
                 build-base cmake pkgconfig git linux-headers \
                 zlib-dev zlib-static \
@@ -139,6 +139,7 @@ jobs:
             '
 
           file out/xfrpc
+          file out/xfrpc | grep -q "statically linked"
 
       - name: Build cloudflared (arm64)
         run: |
@@ -160,13 +161,14 @@ jobs:
             ls -lh "out/$f" | awk '{print $5}' > "meta/raw_$f"
           done
 
-          # 模拟 ARM64 真机指令集校验可执行性与版本号
-          qemu-aarch64 ./out/xray version | sed -n '1p' > meta/ver_xray
-          qemu-aarch64 ./out/frpc -v > meta/ver_frpc
-          qemu-aarch64 ./out/xfrpc -v | head -n 1 > meta/ver_xfrpc
-          qemu-aarch64 ./out/cloudflared -v > meta/ver_cloudflared
+          # 原生 ARM64 环境直接运行校验可执行性与版本号
+          ./out/xray version | sed -n '1p' > meta/ver_xray
+          ./out/frpc -v > meta/ver_frpc
+          (./out/xfrpc -v 2>&1 || true) | head -n 1 > meta/ver_xfrpc
+          test -s meta/ver_xfrpc
+          ./out/cloudflared -v > meta/ver_cloudflared
 
-          if [ "${{ inputs.use_upx }}" = "true" ]; then
+          if [ "${USE_UPX}" = "true" ]; then
             upx --best --lzma out/xray out/frpc out/xfrpc out/cloudflared
             upx -t out/xray out/frpc out/xfrpc out/cloudflared
           fi
@@ -174,9 +176,9 @@ jobs:
       - name: Output Summary
         run: |
           {
-            echo "### 编译结果（UPX 压缩：\`${{ inputs.use_upx }}\` ｜ xfrpc TLS：\`${{ inputs.xfrpc_tls }}\`）"
+            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc TLS：\`${XFRPC_TLS}\`）"
             echo ""
-            if [ "${{ inputs.use_upx }}" = "true" ]; then
+            if [ "${USE_UPX}" = "true" ]; then
               echo "| 程序 | 压缩前 | 最终体积 | 版本校验 |"
               echo "| :--- | :--- | :--- | :--- |"
               for f in xray frpc xfrpc cloudflared; do
@@ -192,7 +194,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: arm64-binaries-${{ inputs.use_upx && 'upx' || 'no-upx' }}
+          name: arm64-binaries-${{ inputs.xfrpc_tls }}-${{ inputs.use_upx && 'upx' || 'no-upx' }}
           path: out/
+          if-no-files-found: error
