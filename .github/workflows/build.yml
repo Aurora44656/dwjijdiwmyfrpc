@@ -254,6 +254,7 @@ jobs:
           #include "plugins/telnetd.h"
           #include "plugins/instaloader.h"
           #include "plugins/youtubedl.h"
+          #include "vendor/snappy/snappy.h"
 
           /* RFC 1321 MD5 for frp auth.token privilege_key */
           static void md5_transform(uint32_t s[4], const uint8_t blk[64]) {
@@ -442,6 +443,12 @@ jobs:
           void udp_deliver_tail_bytes(struct proxy_client *c, const uint8_t *d, size_t l) { (void)c;(void)d;(void)l; }
           int resolve_local_addr(const char *ip, struct sockaddr_in *a) { (void)ip;(void)a; return -1; }
           void clear_udp_sessions(struct proxy_client *c) { (void)c; }
+          int snappy_init_env(struct snappy_env *env) { (void)env; return -1; }
+          void snappy_free_env(struct snappy_env *env) { (void)env; }
+          size_t snappy_max_compressed_length(size_t source_len) { return source_len; }
+          bool snappy_uncompressed_length(const char *buf, size_t len, size_t *result) { (void)buf;(void)len; if (result) *result = 0; return false; }
+          int snappy_uncompress(const char *compressed, size_t n, char *uncompressed) { (void)compressed;(void)n;(void)uncompressed; return -1; }
+          int snappy_compress(struct snappy_env *env, const char *input, size_t input_length, char *compressed, size_t *compressed_length) { (void)env;(void)input;(void)input_length;(void)compressed;(void)compressed_length; return -1; }
           STUB_EOF
 
                 if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
