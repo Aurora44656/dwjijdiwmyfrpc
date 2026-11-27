@@ -190,6 +190,75 @@ jobs:
               git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
               cd /tmp/xfrpc
 
+              # 修复原版 xfrpc 仅支持 IPv4 (AF_INET) 导致无法直连 IPv6 frps 的硬伤（全模式生效）
+              awk '
+                /^int is_valid_ip_address\(/ {
+                  print "int is_valid_ip_address(const char *ip_address)"
+                  print "{"
+                  print "\tif (!ip_address || !*ip_address) return 0;"
+                  print "\tchar buf[64];"
+                  print "\tsize_t len = strlen(ip_address);"
+                  print "\tif (ip_address[0] == '\''['\'' && len > 2 && ip_address[len - 1] == '\'']'\'' && len - 2 < sizeof(buf)) {"
+                  print "\t\tmemcpy(buf, ip_address + 1, len - 2);"
+                  print "\t\tbuf[len - 2] = '\''\\0'\'';"
+                  print "\t\tip_address = buf;"
+                  print "\t}"
+                  print "\tstruct in_addr a4;"
+                  print "\tstruct in6_addr a6;"
+                  print "\treturn inet_pton(AF_INET, ip_address, &a4) == 1 || inet_pton(AF_INET6, ip_address, &a6) == 1;"
+                  print "}"
+                  skip=1; next
+                }
+                skip && /^\}$/ { skip=0; next }
+                !skip { print }
+              ' utils.c > utils.c.tmp && mv utils.c.tmp utils.c
+
+              awk '
+                /if \(is_valid_ip_address\(name\)\) \{/ {
+                  print "\tif (is_valid_ip_address(name)) {"
+                  print "\t\tchar ipbuf[64];"
+                  print "\t\tconst char *ipstr = name;"
+                  print "\t\tsize_t ilen = strlen(name);"
+                  print "\t\tif (name[0] == '\''['\'' && ilen > 2 && name[ilen - 1] == '\'']'\'' && ilen - 2 < sizeof(ipbuf)) {"
+                  print "\t\t\tmemcpy(ipbuf, name + 1, ilen - 2);"
+                  print "\t\t\tipbuf[ilen - 2] = '\''\\0'\'';"
+                  print "\t\t\tipstr = ipbuf;"
+                  print "\t\t}"
+                  print "\t\tstruct sockaddr_storage ss;"
+                  print "\t\tmemset(&ss, 0, sizeof(ss));"
+                  print "\t\tint slen = 0;"
+                  print "\t\tstruct in_addr a4;"
+                  print "\t\tstruct in6_addr a6;"
+                  print "\t\tif (inet_pton(AF_INET, ipstr, &a4) == 1) {"
+                  print "\t\t\tstruct sockaddr_in *sin = (struct sockaddr_in *)&ss;"
+                  print "\t\t\tsin->sin_family = AF_INET;"
+                  print "\t\t\tsin->sin_addr = a4;"
+                  print "\t\t\tsin->sin_port = htons(port);"
+                  print "\t\t\tslen = (int)sizeof(*sin);"
+                  print "\t\t} else if (inet_pton(AF_INET6, ipstr, &a6) == 1) {"
+                  print "\t\t\tstruct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;"
+                  print "\t\t\tsin6->sin6_family = AF_INET6;"
+                  print "\t\t\tsin6->sin6_addr = a6;"
+                  print "\t\t\tsin6->sin6_port = htons(port);"
+                  print "\t\t\tslen = (int)sizeof(*sin6);"
+                  print "\t\t}"
+                  print "\t\tif (slen == 0 || bufferevent_socket_connect(bev, (struct sockaddr *)&ss, slen) < 0) {"
+                  print "\t\t\tdebug(LOG_ERR, \"Direct IP connection failed to %s:%d\", name, port);"
+                  print "\t\t\tbufferevent_free(bev);"
+                  print "\t\t\treturn NULL;"
+                  print "\t\t}"
+                  print "\t}"
+                  skip=1; next
+                }
+                skip && /^\t\}$/ { skip=0; next }
+                {
+                  if (!skip) {
+                    gsub(/AF_INET, name, port\)/, "AF_UNSPEC, name, port)")
+                    print
+                  }
+                }
+              ' control.c > control.c.tmp && mv control.c.tmp control.c
+
               if [ "${XFRPC_TLS}" = "notls-hybrid" ] || [ "${XFRPC_TLS}" = "notls-static" ]; then
                 # 彻底移除 OpenSSL、zlib、mongoose、全部插件及未用协议（仅保留 TOML/INI + auth.token MD5 + TCP/TCPMux）
                 cat > ssl_compat.h << 'HDR_EOF'
