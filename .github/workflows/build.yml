@@ -119,10 +119,11 @@ jobs:
                 cd /tmp/wolfssl
                 ./autogen.sh
                 ./configure --prefix=/usr --enable-static --disable-shared \
+                  --disable-examples --disable-crypttests \
                   --enable-opensslextra --enable-opensslall --enable-tls13 \
                   --enable-sni --enable-alpn --enable-session-ticket \
                   --enable-armasm \
-                  CFLAGS="${CFLAGS_OPT}"
+                  CFLAGS="-Os"
                 make -j"$(nproc)"
                 make install
                 TLS_FLAG="-DUSE_WOLFSSL=ON"
