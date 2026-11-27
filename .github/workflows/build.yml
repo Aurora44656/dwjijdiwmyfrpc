@@ -10,7 +10,7 @@ on:
       xfrpc_tls:
         description: 'xfrpc TLS 后端（openssl 编译最快；wolfssl 体积最小）'
         type: choice
-        default: openssl
+        default: wolfssl
         options:
           - openssl
           - wolfssl
