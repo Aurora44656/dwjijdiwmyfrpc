@@ -20,6 +20,10 @@ on:
         description: 'xfrpc 版本 Tag（默认锁定已验证的 5.11.1004；填 latest 自动拉取最新 Release）'
         type: string
         default: '5.11.1004'
+      xfrpc_4k_page:
+        description: '启用 xfrpc 4096 (4 KB) 页对齐（去除 ARM64 默认 64 KB 段填充，仅适用于 4 KB 页内核的路由器）'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -33,6 +37,7 @@ jobs:
       USE_UPX: ${{ inputs.use_upx }}
       XFRPC_TLS: ${{ inputs.xfrpc_tls }}
       XFRPC_REF: ${{ inputs.xfrpc_ref }}
+      XFRPC_4K_PAGE: ${{ inputs.xfrpc_4k_page }}
 
     steps:
       - name: Setup Go
@@ -85,12 +90,13 @@ jobs:
           else
             TAG="${XFRPC_REF}"
           fi
-          echo "Building xfrpc ${TAG} (Mode: ${XFRPC_TLS})..."
+          echo "Building xfrpc ${TAG} (Mode: ${XFRPC_TLS}, 4K page: ${XFRPC_4K_PAGE})..."
 
           docker run --rm -i \
             -v "${PWD}/out:/out" \
             -e XFRPC_TAG="${TAG}" \
             -e XFRPC_TLS="${XFRPC_TLS}" \
+            -e XFRPC_4K_PAGE="${XFRPC_4K_PAGE}" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             alpine:3.24 sh -eux << 'DOCKER_EOF'
@@ -98,6 +104,10 @@ jobs:
 
               CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -fmerge-all-constants -fno-ident -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
               COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
+              PAGE_LDFLAGS=""
+              if [ "${XFRPC_4K_PAGE}" = "true" ]; then
+                PAGE_LDFLAGS="-Wl,-z,max-page-size=4096 -Wl,-z,noseparate-code"
+              fi
 
               # 1. 准备 libjson-c（notls-hybrid 直接动态链接系统 libjson-c.so.5；其余全静态模式从源码编 libjson-c.a）
               if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
@@ -722,7 +732,7 @@ jobs:
                     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                     -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                     -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
-                    -DCMAKE_EXE_LINKER_FLAGS="${CFLAGS_OPT} -static-libgcc -Wl,--as-needed -Wl,--gc-sections -Wl,--build-id=none -Wl,-s"
+                    -DCMAKE_EXE_LINKER_FLAGS="${CFLAGS_OPT} -static-libgcc -Wl,--as-needed -Wl,--gc-sections -Wl,--build-id=none ${PAGE_LDFLAGS} -Wl,-s"
                 else
                   cat > CMakeLists.txt << 'CMAKE_EOF'
           cmake_minimum_required(VERSION 3.5...3.27)
@@ -750,7 +760,7 @@ jobs:
                     -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                     -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                     -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                    -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none -Wl,-s"
+                    -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none ${PAGE_LDFLAGS} -Wl,-s"
                 fi
               else
                 if [ "${XFRPC_TLS}" = "slim" ]; then
@@ -773,7 +783,7 @@ jobs:
                   -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                   -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                   -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                  -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none -Wl,-s" \
+                  -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none ${PAGE_LDFLAGS} -Wl,-s" \
                   -DOPENSSL_USE_STATIC_LIBS=ON \
                   -DUSE_WOLFSSL=OFF \
                   -DENABLE_QUIC=OFF \
@@ -848,7 +858,7 @@ jobs:
       - name: Output Summary
         run: |
           {
-            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc 模式：\`${XFRPC_TLS}\`）"
+            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc 模式：\`${XFRPC_TLS}\` ｜ 4K 对齐：\`${XFRPC_4K_PAGE}\`）"
             echo ""
             if [ "${USE_UPX}" = "true" ]; then
               echo "| 程序 | 压缩前 | 最终体积 | 版本校验 |"
