@@ -7,6 +7,13 @@ on:
         description: '启用 UPX 压缩（放 /tmp 运行请保持取消勾选；放闪存 /overlay 再勾选）'
         type: boolean
         default: false
+      xfrpc_tls:
+        description: 'xfrpc TLS 后端（openssl 编译最快；wolfssl 体积最小）'
+        type: choice
+        default: openssl
+        options:
+          - openssl
+          - wolfssl
 
 jobs:
   build:
@@ -18,6 +25,11 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+
+      - name: Set up QEMU for Docker (arm64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Install QEMU & Optional UPX
         run: |
@@ -55,6 +67,79 @@ jobs:
             -ldflags="-s -w -buildid= -X github.com/fatedier/frp/pkg/util/version.version=${VER}" \
             -o ../out/frpc ./cmd/frpc
 
+      - name: Build xfrpc (arm64, musl static)
+        run: |
+          mkdir -p out
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/releases/latest | jq -r .tag_name)
+          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/tags | jq -r '.[0].name')
+          fi
+          echo "Building xfrpc ${TAG} (TLS: ${{ inputs.xfrpc_tls }})..."
+
+          WOLFSSL_TAG=""
+          if [ "${{ inputs.xfrpc_tls }}" = "wolfssl" ]; then
+            WOLFSSL_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/wolfSSL/wolfssl/releases/latest | jq -r .tag_name)
+            echo "Building static wolfSSL ${WOLFSSL_TAG}..."
+          fi
+
+          docker run --rm --platform linux/arm64 \
+            -v "${PWD}/out:/out" \
+            -e XFRPC_TAG="${TAG}" \
+            -e XFRPC_TLS="${{ inputs.xfrpc_tls }}" \
+            -e WOLFSSL_TAG="${WOLFSSL_TAG}" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            alpine:3.21 sh -euxc '
+              apk add --no-cache \
+                build-base cmake pkgconfig git linux-headers \
+                zlib-dev zlib-static \
+                json-c-dev json-c-static \
+                libevent-dev libevent-static \
+                openssl-dev openssl-libs-static
+
+              CFLAGS_OPT="-Os -march=armv8-a+crc+crypto -mtune=cortex-a53"
+
+              if [ "${XFRPC_TLS}" = "wolfssl" ]; then
+                apk add --no-cache autoconf automake libtool
+                git clone --depth 1 --branch "${WOLFSSL_TAG}" https://github.com/wolfSSL/wolfssl.git /tmp/wolfssl
+                cd /tmp/wolfssl
+                ./autogen.sh
+                ./configure --prefix=/usr --enable-static --disable-shared \
+                  --enable-opensslextra --enable-opensslall --enable-tls13 \
+                  --enable-sni --enable-alpn --enable-session-ticket \
+                  --enable-armasm \
+                  CFLAGS="${CFLAGS_OPT}"
+                make -j"$(nproc)"
+                make install
+                TLS_FLAG="-DUSE_WOLFSSL=ON"
+              else
+                TLS_FLAG="-DUSE_WOLFSSL=OFF"
+              fi
+
+              git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
+              cd /tmp/xfrpc
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+                -DCMAKE_EXE_LINKER_FLAGS="-static" \
+                -DOPENSSL_USE_STATIC_LIBS=ON \
+                ${TLS_FLAG} \
+                -DENABLE_QUIC=OFF \
+                -DBUILD_STATIC=ON \
+                -DDEBUG=OFF
+              cmake --build build -j"$(nproc)"
+
+              BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
+              test -n "${BIN}"
+              strip --strip-all "${BIN}"
+              cp "${BIN}" /out/xfrpc
+              chmod 755 /out/xfrpc
+              chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
+            '
+
+          file out/xfrpc
+
       - name: Build cloudflared (arm64)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
@@ -71,35 +156,36 @@ jobs:
       - name: Verify Binaries & Optional UPX
         run: |
           mkdir -p meta
-          for f in xray frpc cloudflared; do
+          for f in xray frpc xfrpc cloudflared; do
             ls -lh "out/$f" | awk '{print $5}' > "meta/raw_$f"
           done
 
           # 模拟 ARM64 真机指令集校验可执行性与版本号
           qemu-aarch64 ./out/xray version | sed -n '1p' > meta/ver_xray
           qemu-aarch64 ./out/frpc -v > meta/ver_frpc
+          qemu-aarch64 ./out/xfrpc -v | head -n 1 > meta/ver_xfrpc
           qemu-aarch64 ./out/cloudflared -v > meta/ver_cloudflared
 
           if [ "${{ inputs.use_upx }}" = "true" ]; then
-            upx --best --lzma out/xray out/frpc out/cloudflared
-            upx -t out/xray out/frpc out/cloudflared
+            upx --best --lzma out/xray out/frpc out/xfrpc out/cloudflared
+            upx -t out/xray out/frpc out/xfrpc out/cloudflared
           fi
 
       - name: Output Summary
         run: |
           {
-            echo "### 编译结果（UPX 压缩：\`${{ inputs.use_upx }}\`）"
+            echo "### 编译结果（UPX 压缩：\`${{ inputs.use_upx }}\` ｜ xfrpc TLS：\`${{ inputs.xfrpc_tls }}\`）"
             echo ""
             if [ "${{ inputs.use_upx }}" = "true" ]; then
               echo "| 程序 | 压缩前 | 最终体积 | 版本校验 |"
               echo "| :--- | :--- | :--- | :--- |"
-              for f in xray frpc cloudflared; do
+              for f in xray frpc xfrpc cloudflared; do
                 echo "| \`$f\` | $(cat meta/raw_$f) | **$(ls -lh out/$f | awk '{print $5}')** | \`$(tr -d '\r\n' < meta/ver_$f)\` |"
               done
             else
               echo "| 程序 | 最终体积 | 版本校验 |"
               echo "| :--- | :--- | :--- |"
-              for f in xray frpc cloudflared; do
+              for f in xray frpc xfrpc cloudflared; do
                 echo "| \`$f\` | **$(cat meta/raw_$f)** | \`$(tr -d '\r\n' < meta/ver_$f)\` |"
               done
             fi
