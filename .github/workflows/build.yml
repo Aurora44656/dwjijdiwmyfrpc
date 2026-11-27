@@ -16,6 +16,10 @@ on:
           - notls-static
           - slim
           - alpine
+      xfrpc_ref:
+        description: 'xfrpc 版本 Tag（默认锁定已验证的 5.11.1004；填 latest 自动拉取最新 Release）'
+        type: string
+        default: '5.11.1004'
 
 permissions:
   contents: read
@@ -28,6 +32,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       USE_UPX: ${{ inputs.use_upx }}
       XFRPC_TLS: ${{ inputs.xfrpc_tls }}
+      XFRPC_REF: ${{ inputs.xfrpc_ref }}
 
     steps:
       - name: Setup Go
@@ -72,9 +77,13 @@ jobs:
       - name: Build xfrpc (arm64, musl)
         run: |
           mkdir -p out
-          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/releases/latest | jq -r .tag_name)
-          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
-            TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/tags | jq -r '.[0].name')
+          if [ -z "${XFRPC_REF}" ] || [ "${XFRPC_REF}" = "latest" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/releases/latest | jq -r .tag_name)
+            if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
+              TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/tags | jq -r '.[0].name')
+            fi
+          else
+            TAG="${XFRPC_REF}"
           fi
           echo "Building xfrpc ${TAG} (Mode: ${XFRPC_TLS})..."
 
