@@ -8,12 +8,12 @@ on:
         type: boolean
         default: false
       xfrpc_tls:
-        description: 'xfrpc TLS 后端（openssl 编译最快；wolfssl 体积最小）'
+        description: 'xfrpc TLS 后端（wolfssl 体积最小；openssl 编译最快）'
         type: choice
         default: wolfssl
         options:
-          - openssl
           - wolfssl
+          - openssl
 
 permissions:
   contents: read
@@ -93,10 +93,9 @@ jobs:
               apk add --no-cache \
                 build-base cmake pkgconfig git linux-headers \
                 zlib-dev zlib-static \
-                libevent-dev libevent-static \
-                openssl-dev openssl-libs-static
+                libevent-dev libevent-static
 
-              CFLAGS_OPT="-Os -march=armv8-a+crc+crypto -mtune=cortex-a53"
+              CFLAGS_OPT="-Os -march=armv8-a+crc+crypto -mtune=cortex-a53 -ffunction-sections -fdata-sections"
 
               # Alpine 官方源无 json-c-static，从源码编译纯静态 libjson-c.a
               git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
@@ -120,15 +119,16 @@ jobs:
                 ./autogen.sh
                 ./configure --prefix=/usr --enable-static --disable-shared \
                   --disable-examples --disable-crypttests \
-                  --enable-opensslextra --enable-opensslall --enable-tls13 \
+                  --enable-opensslextra --enable-tls13 \
                   --enable-sni --enable-alpn --enable-session-ticket \
                   --enable-armasm \
-                  CFLAGS="-Os"
+                  CFLAGS="-Os -ffunction-sections -fdata-sections"
                 make -j"$(nproc)"
                 make install
-                TLS_FLAG="-DUSE_WOLFSSL=ON"
+                TLS_FLAGS="-DUSE_WOLFSSL=ON"
               else
-                TLS_FLAG="-DUSE_WOLFSSL=OFF"
+                apk add --no-cache openssl-dev openssl-libs-static
+                TLS_FLAGS="-DUSE_WOLFSSL=OFF -DOPENSSL_USE_STATIC_LIBS=ON"
               fi
 
               git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
@@ -138,9 +138,8 @@ jobs:
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                 -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static" \
-                -DOPENSSL_USE_STATIC_LIBS=ON \
-                ${TLS_FLAG} \
+                -DCMAKE_EXE_LINKER_FLAGS="-static -no-pie -Wl,--gc-sections" \
+                ${TLS_FLAGS} \
                 -DENABLE_QUIC=OFF \
                 -DBUILD_STATIC=ON \
                 -DDEBUG=OFF
@@ -149,6 +148,14 @@ jobs:
               BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
               test -n "${BIN}"
               strip --strip-all "${BIN}"
+
+              if [ "${XFRPC_TLS}" = "wolfssl" ]; then
+                if strings "${BIN}" | grep -Eq "OpenSSL [13]\."; then
+                  echo "ERROR: xfrpc 意外链接了 OpenSSL，未真正使用 wolfSSL！" >&2
+                  exit 1
+                fi
+              fi
+
               cp "${BIN}" /out/xfrpc
               chmod 755 /out/xfrpc
               chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
@@ -156,7 +163,7 @@ jobs:
 
           file out/xfrpc
           file out/xfrpc | grep -Eq "statically linked|static-pie linked"
-          
+
       - name: Build cloudflared (arm64)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
