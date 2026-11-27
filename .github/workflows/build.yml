@@ -264,6 +264,23 @@ jobs:
                 cat > ssl_compat.h << 'HDR_EOF'
           #ifndef XFRPC_SSL_COMPAT_H
           #define XFRPC_SSL_COMPAT_H
+          #include <stddef.h>
+          #include <stdint.h>
+          typedef struct mini_cfb_ctx EVP_CIPHER_CTX;
+          typedef void EVP_MD;
+          typedef void EVP_CIPHER;
+          const EVP_MD *EVP_sha1(void);
+          const EVP_CIPHER *EVP_aes_128_cfb(void);
+          int PKCS5_PBKDF2_HMAC(const char *pass, int passlen, const unsigned char *salt, int saltlen, int iter, const EVP_MD *digest, int keylen, unsigned char *out);
+          int RAND_bytes(unsigned char *buf, int num);
+          EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void);
+          void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx);
+          int EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type, void *impl, const unsigned char *key, const unsigned char *iv);
+          int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in, int inl);
+          int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+          int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type, void *impl, const unsigned char *key, const unsigned char *iv);
+          int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in, int inl);
+          int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
           #endif
           HDR_EOF
 
@@ -397,21 +414,175 @@ jobs:
           unsigned long ERR_get_error(void) { return 0; }
           void ERR_error_string_n(unsigned long e, char *buf, size_t len) { (void)e; if (buf && len) buf[0] = '\0'; }
 
-          size_t get_encrypt_block_size(void) { return 16; }
-          size_t get_block_size(void) { return 16; }
-          int is_encoder_inited(void) { return 0; }
-          int is_decoder_inited(void) { return 0; }
-          struct frp_coder *init_main_encoder(void) { return NULL; }
-          struct frp_coder *init_main_decoder(const uint8_t *iv) { (void)iv; return NULL; }
-          struct frp_coder *new_coder(const char *t, const char *s) { (void)t; (void)s; return NULL; }
-          struct frp_coder *get_main_encoder(void) { return NULL; }
-          struct frp_coder *get_main_decoder(void) { return NULL; }
-          uint8_t *encrypt_key(const char *t, size_t tl, const char *s, uint8_t *k, size_t kl) { (void)t;(void)tl;(void)s;(void)k;(void)kl; return NULL; }
-          uint8_t *encrypt_iv(uint8_t *iv, size_t l) { (void)iv;(void)l; return NULL; }
-          size_t encrypt_data(const uint8_t *d, size_t l, struct frp_coder *e, uint8_t **r) { (void)d;(void)l;(void)e;(void)r; return 0; }
-          size_t decrypt_data(const uint8_t *d, size_t l, struct frp_coder *e, uint8_t **r) { (void)d;(void)l;(void)e;(void)r; return 0; }
-          void free_encoder(struct frp_coder *e) { (void)e; }
-          void free_crypto_resources(void) {}
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include "ssl_compat.h"
+          /* Pure-C SHA-1 + PBKDF2-HMAC-SHA1 + AES-128-CFB128 for frp v1 control channel (zero OpenSSL) */
+          typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t idx; } mini_sha1_ctx;
+          static uint32_t rol32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+          static void sha1_blk(uint32_t h[5], const uint8_t b[64]) {
+              uint32_t w[80];
+              for (int i = 0; i < 16; i++)
+                  w[i] = ((uint32_t)b[i*4]<<24)|((uint32_t)b[i*4+1]<<16)|((uint32_t)b[i*4+2]<<8)|b[i*4+3];
+              for (int i = 16; i < 80; i++) w[i] = rol32(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+              uint32_t a=h[0], bb=h[1], c=h[2], d=h[3], e=h[4];
+              for (int i = 0; i < 80; i++) {
+                  uint32_t f, k;
+                  if (i < 20)      { f = (bb & c) | ((~bb) & d); k = 0x5A827999; }
+                  else if (i < 40) { f = bb ^ c ^ d;             k = 0x6ED9EBA1; }
+                  else if (i < 60) { f = (bb & c) | (bb & d) | (c & d); k = 0x8F1BBCDC; }
+                  else             { f = bb ^ c ^ d;             k = 0xCA62C1D6; }
+                  uint32_t t = rol32(a, 5) + f + e + k + w[i];
+                  e = d; d = c; c = rol32(bb, 30); bb = a; a = t;
+              }
+              h[0]+=a; h[1]+=bb; h[2]+=c; h[3]+=d; h[4]+=e;
+          }
+          static void sha1_init(mini_sha1_ctx *c) {
+              c->h[0]=0x67452301; c->h[1]=0xEFCDAB89; c->h[2]=0x98BADCFE; c->h[3]=0x10325476; c->h[4]=0xC3D2E1F0;
+              c->len = 0; c->idx = 0;
+          }
+          static void sha1_upd(mini_sha1_ctx *c, const uint8_t *d, size_t n) {
+              c->len += n;
+              while (n--) {
+                  c->buf[c->idx++] = *d++;
+                  if (c->idx == 64) { sha1_blk(c->h, c->buf); c->idx = 0; }
+              }
+          }
+          static void sha1_fin(mini_sha1_ctx *c, uint8_t out[20]) {
+              uint64_t bits = c->len * 8;
+              c->buf[c->idx++] = 0x80;
+              if (c->idx > 56) { memset(c->buf + c->idx, 0, 64 - c->idx); sha1_blk(c->h, c->buf); c->idx = 0; }
+              memset(c->buf + c->idx, 0, 56 - c->idx);
+              for (int i = 0; i < 8; i++) c->buf[56 + i] = (uint8_t)(bits >> (56 - i*8));
+              sha1_blk(c->h, c->buf);
+              for (int i = 0; i < 5; i++) {
+                  out[i*4]   = (uint8_t)(c->h[i] >> 24); out[i*4+1] = (uint8_t)(c->h[i] >> 16);
+                  out[i*4+2] = (uint8_t)(c->h[i] >> 8);  out[i*4+3] = (uint8_t)(c->h[i]);
+              }
+          }
+          static void hmac_sha1(const uint8_t *k, size_t kl, const uint8_t *m, size_t ml, uint8_t out[20]) {
+              uint8_t kb[64], pad[64], inner[20];
+              memset(kb, 0, 64);
+              if (kl > 64) { mini_sha1_ctx c; sha1_init(&c); sha1_upd(&c, k, kl); sha1_fin(&c, kb); }
+              else memcpy(kb, k, kl);
+              for (int i = 0; i < 64; i++) pad[i] = kb[i] ^ 0x36;
+              mini_sha1_ctx c; sha1_init(&c); sha1_upd(&c, pad, 64); sha1_upd(&c, m, ml); sha1_fin(&c, inner);
+              for (int i = 0; i < 64; i++) pad[i] = kb[i] ^ 0x5c;
+              sha1_init(&c); sha1_upd(&c, pad, 64); sha1_upd(&c, inner, 20); sha1_fin(&c, out);
+          }
+          const EVP_MD *EVP_sha1(void) { return (const EVP_MD *)1; }
+          const EVP_CIPHER *EVP_aes_128_cfb(void) { return (const EVP_CIPHER *)1; }
+          int PKCS5_PBKDF2_HMAC(const char *pass, int passlen, const unsigned char *salt, int saltlen, int iter, const EVP_MD *digest, int keylen, unsigned char *out) {
+              (void)digest;
+              uint8_t sb[128], u[20], t[20];
+              if (!out || keylen <= 0 || keylen > 20 || saltlen < 0 || (size_t)saltlen + 4 > sizeof(sb)) return 0;
+              memcpy(sb, salt, (size_t)saltlen);
+              sb[saltlen]=0; sb[saltlen+1]=0; sb[saltlen+2]=0; sb[saltlen+3]=1;
+              hmac_sha1((const uint8_t *)pass, (size_t)passlen, sb, (size_t)saltlen + 4, u);
+              memcpy(t, u, 20);
+              for (int i = 1; i < iter; i++) {
+                  hmac_sha1((const uint8_t *)pass, (size_t)passlen, u, 20, u);
+                  for (int j = 0; j < 20; j++) t[j] ^= u[j];
+              }
+              memcpy(out, t, (size_t)keylen);
+              return 1;
+          }
+          int RAND_bytes(unsigned char *buf, int num) {
+              if (!buf || num <= 0) return 0;
+              int fd = open("/dev/urandom", O_RDONLY);
+              if (fd < 0) return 0;
+              int got = 0;
+              while (got < num) {
+                  ssize_t r = read(fd, buf + got, (size_t)(num - got));
+                  if (r <= 0) { close(fd); return 0; }
+                  got += (int)r;
+              }
+              close(fd);
+              return 1;
+          }
+          static const uint8_t aes_sbox[256] = {
+              0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+              0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+              0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+              0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+              0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+              0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+              0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+              0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+              0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+              0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+              0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+              0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+              0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+              0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+              0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+              0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+          };
+          static uint8_t aes_xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
+          static void aes128_keyexp(const uint8_t key[16], uint8_t rk[176]) {
+              static const uint8_t rcon[10] = {1,2,4,8,16,32,64,128,27,54};
+              memcpy(rk, key, 16);
+              for (int i = 4; i < 44; i++) {
+                  uint8_t t[4]; memcpy(t, rk + (i - 1)*4, 4);
+                  if (i % 4 == 0) {
+                      uint8_t tmp = t[0]; t[0] = aes_sbox[t[1]] ^ rcon[i/4 - 1];
+                      t[1] = aes_sbox[t[2]]; t[2] = aes_sbox[t[3]]; t[3] = aes_sbox[tmp];
+                  }
+                  for (int j = 0; j < 4; j++) rk[i*4 + j] = rk[(i - 4)*4 + j] ^ t[j];
+              }
+          }
+          static void aes128_enc_blk(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16]) {
+              uint8_t s[16];
+              for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[i];
+              for (int r = 1; r <= 10; r++) {
+                  uint8_t t[16];
+                  for (int i = 0; i < 16; i++) t[i] = aes_sbox[s[i]];
+                  s[0]=t[0];  s[1]=t[5];  s[2]=t[10]; s[3]=t[15];
+                  s[4]=t[4];  s[5]=t[9];  s[6]=t[14]; s[7]=t[3];
+                  s[8]=t[8];  s[9]=t[13]; s[10]=t[2]; s[11]=t[7];
+                  s[12]=t[12];s[13]=t[1]; s[14]=t[6]; s[15]=t[11];
+                  if (r < 10) {
+                      for (int c = 0; c < 4; c++) {
+                          uint8_t *p = s + c*4, a0=p[0], a1=p[1], a2=p[2], a3=p[3], x=a0^a1^a2^a3;
+                          p[0] ^= x ^ aes_xt(a0^a1); p[1] ^= x ^ aes_xt(a1^a2);
+                          p[2] ^= x ^ aes_xt(a2^a3); p[3] ^= x ^ aes_xt(a3^a0);
+                      }
+                  }
+                  for (int i = 0; i < 16; i++) s[i] ^= rk[r*16 + i];
+              }
+              memcpy(out, s, 16);
+          }
+          struct mini_cfb_ctx { uint8_t rk[176], iv[16]; int num; };
+          static void cfb128_crypt(struct mini_cfb_ctx *c, const uint8_t *in, uint8_t *out, size_t len, int enc) {
+              int n = c->num;
+              for (size_t i = 0; i < len; i++) {
+                  if (n == 0) aes128_enc_blk(c->rk, c->iv, c->iv);
+                  if (enc) { uint8_t ct = in[i] ^ c->iv[n]; c->iv[n] = ct; out[i] = ct; }
+                  else     { uint8_t ct = in[i]; out[i] = ct ^ c->iv[n]; c->iv[n] = ct; }
+                  n = (n + 1) & 15;
+              }
+              c->num = n;
+          }
+          EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void) { return (EVP_CIPHER_CTX *)calloc(1, sizeof(struct mini_cfb_ctx)); }
+          void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx) { free(ctx); }
+          int EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type, void *impl, const unsigned char *key, const unsigned char *iv) {
+              (void)type; (void)impl;
+              if (!ctx || !key || !iv) return 0;
+              aes128_keyexp(key, ctx->rk); memcpy(ctx->iv, iv, 16); ctx->num = 0; return 1;
+          }
+          int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type, void *impl, const unsigned char *key, const unsigned char *iv) {
+              return EVP_EncryptInit_ex(ctx, type, impl, key, iv);
+          }
+          int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in, int inl) {
+              if (!ctx || !out || !outl || !in || inl < 0) return 0;
+              cfb128_crypt(ctx, in, out, (size_t)inl, 1); *outl = inl; return 1;
+          }
+          int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl, const unsigned char *in, int inl) {
+              if (!ctx || !out || !outl || !in || inl < 0) return 0;
+              cfb128_crypt(ctx, in, out, (size_t)inl, 0); *outl = inl; return 1;
+          }
+          int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl) { (void)ctx;(void)out; if (outl) *outl = 0; return 1; }
+          int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl) { (void)ctx;(void)out; if (outl) *outl = 0; return 1; }
 
           int crypto_derive_key(const char *t, uint8_t *k) { (void)t;(void)k; return -1; }
           struct crypto_ctx *crypto_ctx_new_writer(const uint8_t *k) { (void)k; return NULL; }
@@ -530,7 +701,7 @@ jobs:
           add_executable(xfrpc
               main.c client.c config.c control.c ini.c toml_parser.c
               vendor/tomlc17/tomlc17.c msg.c xfrpc.c debug.c commandline.c
-              utils.c common.c login.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
+              utils.c common.c login.c crypto.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
           )
           target_compile_options(xfrpc PRIVATE -Wno-stringop-truncation)
           target_link_libraries(xfrpc PRIVATE /usr/lib/libevent.a json-c)
@@ -557,7 +728,7 @@ jobs:
           add_executable(xfrpc
               main.c client.c config.c control.c ini.c toml_parser.c
               vendor/tomlc17/tomlc17.c msg.c xfrpc.c debug.c commandline.c
-              utils.c common.c login.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
+              utils.c common.c login.c crypto.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
           )
           target_compile_options(xfrpc PRIVATE -Wno-stringop-truncation)
           target_link_libraries(xfrpc PRIVATE ${LIBEVENT_LIB} ${JSON-C_LIBRARIES} m pthread)
