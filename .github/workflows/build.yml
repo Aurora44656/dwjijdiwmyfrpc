@@ -8,10 +8,12 @@ on:
         type: boolean
         default: false
       xfrpc_tls:
-        description: 'xfrpc 静态库编译模式（slim 源码极限裁剪 ~1.1M；alpine 预编译包编译最快 ~4.5M）'
+        description: 'xfrpc 编译模式（notls-hybrid 半静态 ~160K；notls-static 全静态 ~300K；slim 全静态 TLS ~850K；alpine 最快 ~4.5M）'
         type: choice
-        default: slim
+        default: notls-hybrid
         options:
+          - notls-hybrid
+          - notls-static
           - slim
           - alpine
 
@@ -67,7 +69,7 @@ jobs:
             -ldflags="-s -w -buildid= -X github.com/fatedier/frp/pkg/util/version.version=${VER}" \
             -o ../out/frpc ./cmd/frpc
 
-      - name: Build xfrpc (arm64, musl static)
+      - name: Build xfrpc (arm64, musl)
         run: |
           mkdir -p out
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/releases/latest | jq -r .tag_name)
@@ -76,44 +78,62 @@ jobs:
           fi
           echo "Building xfrpc ${TAG} (Mode: ${XFRPC_TLS})..."
 
-          docker run --rm \
+          docker run --rm -i \
             -v "${PWD}/out:/out" \
             -e XFRPC_TAG="${TAG}" \
             -e XFRPC_TLS="${XFRPC_TLS}" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            alpine:3.24 sh -euxc '
-              apk add --no-cache \
-                build-base cmake pkgconfig git perl linux-headers \
-                zlib-dev zlib-static
+            alpine:3.24 sh -eux << 'DOCKER_EOF'
+              apk add --no-cache build-base cmake pkgconfig git linux-headers
 
-              CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
+              CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -fmerge-all-constants -fno-ident -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
               COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
 
-              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + gcc-ar LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
-              git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
-              cmake -S /tmp/json-c -B /tmp/json-c/build \
-                -DCMAKE_BUILD_TYPE=MinSizeRel \
-                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-                -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_INSTALL_LIBDIR=lib \
-                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
-                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
-                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
-                -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
-                -DBUILD_SHARED_LIBS=OFF \
-                -DBUILD_STATIC_LIBS=ON \
-                -DBUILD_TESTING=OFF \
-                -DBUILD_APPS=OFF \
-                -DDISABLE_WERROR=ON \
-                -DDISABLE_EXTRA_LIBS=ON
-              cmake --build /tmp/json-c/build -j"$(nproc)"
-              cmake --install /tmp/json-c/build
+              # 1. 准备 libjson-c（notls-hybrid 直接动态链接系统 libjson-c.so.5；其余全静态模式从源码编 libjson-c.a）
+              if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
+                apk add --no-cache json-c-dev
+              else
+                git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
+                cmake -S /tmp/json-c -B /tmp/json-c/build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_INSTALL_PREFIX=/usr \
+                  -DCMAKE_INSTALL_LIBDIR=lib \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DBUILD_SHARED_LIBS=OFF \
+                  -DBUILD_STATIC_LIBS=ON \
+                  -DBUILD_TESTING=OFF \
+                  -DBUILD_APPS=OFF \
+                  -DDISABLE_WERROR=ON \
+                  -DDISABLE_EXTRA_LIBS=ON
+                cmake --build /tmp/json-c/build -j"$(nproc)"
+                cmake --install /tmp/json-c/build
+              fi
 
-              # 2. xfrpc 5.x 已全量硬编码使用 OpenSSL 原生 API（USE_WOLFSSL 在非 QUIC 下已失效且会导致双库同时链接）
-              #    slim 模式：从源码编译极限裁剪的 OpenSSL 1.1.1w + libevent
-              #    注意：OpenSSL 1.1.1 的 ./Configure 会忽略环境变量 CFLAGS，必须将 CFLAGS_OPT 作为位置参数直接传在命令行末尾！
-              if [ "${XFRPC_TLS}" = "slim" ] || [ "${XFRPC_TLS}" = "wolfssl" ]; then
+              # 2. 按模式准备 libevent / OpenSSL / zlib
+              if [ "${XFRPC_TLS}" = "notls-hybrid" ] || [ "${XFRPC_TLS}" = "notls-static" ]; then
+                git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
+                cmake -S /tmp/libevent -B /tmp/libevent/build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_INSTALL_PREFIX=/usr \
+                  -DCMAKE_INSTALL_LIBDIR=lib \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT} ${COMPAT_CFLAGS}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DEVENT__LIBRARY_TYPE=STATIC \
+                  -DEVENT__DISABLE_OPENSSL=ON \
+                  -DEVENT__DISABLE_DEBUG_MODE=ON \
+                  -DEVENT__DISABLE_TESTS=ON \
+                  -DEVENT__DISABLE_REGRESS=ON \
+                  -DEVENT__DISABLE_SAMPLES=ON \
+                  -DEVENT__DISABLE_BENCHMARK=ON
+                cmake --build /tmp/libevent/build -j"$(nproc)"
+                cmake --install /tmp/libevent/build
+              elif [ "${XFRPC_TLS}" = "slim" ]; then
+                apk add --no-cache perl zlib-dev zlib-static
+
                 git clone --depth 1 --branch OpenSSL_1_1_1w https://github.com/openssl/openssl.git /tmp/openssl
                 cd /tmp/openssl
                 ./Configure linux-aarch64 \
@@ -121,26 +141,25 @@ jobs:
                   --libdir=lib \
                   --openssldir=/etc/ssl \
                   no-shared no-dso no-engine no-async no-tests no-ui-console no-err \
-                  no-autoload-config no-autoerrinit no-tls1 no-tls1_1 no-tls1-method no-tls1_1-method \
+                  no-deprecated no-autoalginit no-autoerrinit \
+                  no-ssl3 no-ssl3-method no-tls1 no-tls1-method no-tls1_1 no-tls1_1-method \
+                  no-chacha no-poly1305 \
                   no-aria no-bf no-blake2 no-camellia no-cast no-cmac no-cms no-comp \
                   no-ct no-des no-dh no-dsa no-dtls no-ec2m no-filenames no-gost \
                   no-heartbeats no-idea no-md2 no-md4 no-mdc2 no-multiblock \
                   no-nextprotoneg no-ocb no-ocsp no-psk no-rc2 no-rc4 no-rc5 no-rdrand \
                   no-rfc3779 no-rmd160 no-scrypt no-seed no-siphash no-sm2 no-sm3 \
-                  no-sm4 no-srp no-srtp no-ssl3 no-ts no-whirlpool \
+                  no-sm4 no-srp no-srtp no-ts no-whirlpool \
                   ${CFLAGS_OPT} ${COMPAT_CFLAGS}
 
-                # 剔除 Makefile 中的 -O3 与 187KB 的 P-256 巨型预计算表 (ECP_NISTZ256_ASM)，并校验 section GC 标志已生效
                 sed -i "s/-O3/-Os/g; s/-DECP_NISTZ256_ASM//g" Makefile
                 grep -q -- "-ffunction-sections" Makefile
 
-                # 从全局注册表中剔除 Curve448(X448/Ed448 210KB 预计算表，注意 ASN.1 表位于 standard_methods.h)、SHA-3/Keccak1600 及冷门 AES 模式
-                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
-                ! grep -Eq "ecx448_|ed448_" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
+                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/ameth_lib.c crypto/evp/pmeth_lib.c
                 sed -i "/EVP_sha3_/d; /EVP_shake/d; /EVP_sha512_/d" crypto/evp/c_alld.c
                 sed -i "/_cbc_hmac_/d; /_ccm/d; /_xts/d; /_wrap/d; /_cfb1(/d; /_cfb8(/d; /_ofb/d; /_ecb/d; /aes_192/d" crypto/evp/c_allc.c
 
-                make -j"$(nproc)" build_libs AR="gcc-ar" RANLIB="gcc-ranlib"
+                make -j"$(nproc)" build_libs
                 make install_dev
 
                 git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
@@ -149,8 +168,6 @@ jobs:
                   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                   -DCMAKE_INSTALL_PREFIX=/usr \
                   -DCMAKE_INSTALL_LIBDIR=lib \
-                  -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
-                  -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
                   -DCMAKE_C_FLAGS="${CFLAGS_OPT} ${COMPAT_CFLAGS}" \
                   -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
                   -DEVENT__LIBRARY_TYPE=STATIC \
@@ -164,43 +181,378 @@ jobs:
                 cmake --install /tmp/libevent/build
               else
                 apk add --no-cache \
+                  zlib-dev zlib-static \
                   libevent-dev libevent-static \
                   openssl-dev openssl-libs-static
               fi
 
-              # 3. 编译 xfrpc：修正 CMakeLists.txt 强制追加 -O2/-Werror 及静态库依赖顺序倒置问题，启用全程序 LTO + --gc-sections
+              # 3. 克隆并编译 xfrpc
               git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
               cd /tmp/xfrpc
-              sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
-              sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
 
-              cmake -B build \
-                -DCMAKE_BUILD_TYPE=MinSizeRel \
-                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
-                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
-                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
-                -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
-                -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -fuse-linker-plugin -Wl,--gc-sections -Wl,-s" \
-                -DOPENSSL_USE_STATIC_LIBS=ON \
-                -DUSE_WOLFSSL=OFF \
-                -DENABLE_QUIC=OFF \
-                -DBUILD_STATIC=ON \
-                -DDEBUG=OFF
+              if [ "${XFRPC_TLS}" = "notls-hybrid" ] || [ "${XFRPC_TLS}" = "notls-static" ]; then
+                # 彻底移除 OpenSSL、zlib、mongoose、全部插件及未用协议（仅保留 TOML/INI + auth.token MD5 + TCP/TCPMux）
+                cat > ssl_compat.h << 'HDR_EOF'
+          #ifndef XFRPC_SSL_COMPAT_H
+          #define XFRPC_SSL_COMPAT_H
+          #endif
+          HDR_EOF
+
+                sed -i '1i #include <unistd.h>' client.c
+                sed -i '/<openssl\//d; /<event2\/bufferevent_ssl.h>/d; /<zlib.h>/d' client.c tls.h plugins/https2http.h
+                sed -i '/#define XFRPC_TLS_H/a unsigned long ERR_get_error(void);\nvoid ERR_error_string_n(unsigned long e, char *buf, size_t len);' tls.h
+
+                awk '
+                  /if \(client->local_proxy_bev && ps->plugin &&/ { skip=1; next }
+                  skip && /^\t\} else \{/ { skip=0 }
+                  !skip { print }
+                ' client.c > client.c.tmp && mv client.c.tmp client.c
+
+                awk '
+                  /^static int calc_md5\(/ {
+                    print "extern int notls_md5(const uint8_t *data, size_t len, uint8_t digest[16]);"
+                    print "static int calc_md5(const uint8_t *data, int datalen, uint8_t *digest)"
+                    print "{"
+                    print "\tif (!data || !digest || datalen <= 0) return -1;"
+                    print "\treturn notls_md5(data, (size_t)datalen, digest);"
+                    print "}"
+                    skip=1; next
+                  }
+                  skip && /^\}$/ { skip=0; next }
+                  !skip { print }
+                ' msg.c > msg.c.tmp && mv msg.c.tmp msg.c
+
+                cat > notls_stubs.c << 'STUB_EOF'
+          #include <stddef.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <event2/event.h>
+          #include <event2/bufferevent.h>
+          #include <event2/buffer.h>
+          #include "client.h"
+          #include "config.h"
+          #include "proxy.h"
+          #include "tls.h"
+          #include "crypto.h"
+          #include "crypto_stream.h"
+          #include "aead_stream.h"
+          #include "wire_v2.h"
+          #include "oidc_auth.h"
+          #include "ws_transport.h"
+          #include "health_check.h"
+          #include "zip.h"
+          #include "tcp_redir.h"
+          #include "visitor.h"
+          #include "xtcp_client.h"
+          #include "xtcp_visitor.h"
+          #include "nathole.h"
+          #include "quic_client_transport.h"
+          #include "plugins/https2http.h"
+          #include "plugins/std_plugins.h"
+          #include "plugins/httpd.h"
+          #include "plugins/telnetd.h"
+          #include "plugins/instaloader.h"
+          #include "plugins/youtubedl.h"
+
+          /* RFC 1321 MD5 for frp auth.token privilege_key */
+          static void md5_transform(uint32_t s[4], const uint8_t blk[64]) {
+              static const uint32_t k[64] = {
+                  0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+                  0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+                  0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+                  0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+                  0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+                  0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+                  0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+                  0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+              };
+              static const uint8_t r[64] = {
+                  7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+                  5, 9,14,20,5, 9,14,20,5, 9,14,20,5, 9,14,20,
+                  4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+                  6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+              };
+              uint32_t m[16], a = s[0], b = s[1], c = s[2], d = s[3];
+              for (int i = 0; i < 16; i++)
+                  m[i] = (uint32_t)blk[i*4] | ((uint32_t)blk[i*4+1] << 8) |
+                         ((uint32_t)blk[i*4+2] << 16) | ((uint32_t)blk[i*4+3] << 24);
+              for (int i = 0; i < 64; i++) {
+                  uint32_t f, g;
+                  if (i < 16)      { f = (b & c) | ((~b) & d); g = (uint32_t)i; }
+                  else if (i < 32) { f = (d & b) | ((~d) & c); g = (uint32_t)(5*i + 1) & 15; }
+                  else if (i < 48) { f = b ^ c ^ d;            g = (uint32_t)(3*i + 5) & 15; }
+                  else             { f = c ^ (b | (~d));       g = (uint32_t)(7*i) & 15; }
+                  uint32_t tmp = d;
+                  d = c; c = b;
+                  uint32_t x = a + f + k[i] + m[g];
+                  b += (x << r[i]) | (x >> (32 - r[i]));
+                  a = tmp;
+              }
+              s[0] += a; s[1] += b; s[2] += c; s[3] += d;
+          }
+
+          int notls_md5(const uint8_t *data, size_t len, uint8_t digest[16]) {
+              uint32_t s[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+              uint8_t buf[64];
+              size_t i = 0;
+              while (i + 64 <= len) { md5_transform(s, data + i); i += 64; }
+              size_t rem = len - i;
+              memcpy(buf, data + i, rem);
+              buf[rem++] = 0x80;
+              if (rem > 56) {
+                  memset(buf + rem, 0, 64 - rem);
+                  md5_transform(s, buf);
+                  rem = 0;
+              }
+              memset(buf + rem, 0, 56 - rem);
+              uint64_t bits = (uint64_t)len * 8;
+              for (int j = 0; j < 8; j++) buf[56 + j] = (uint8_t)(bits >> (j * 8));
+              md5_transform(s, buf);
+              for (int j = 0; j < 4; j++) {
+                  digest[j*4]   = (uint8_t)(s[j]);
+                  digest[j*4+1] = (uint8_t)(s[j] >> 8);
+                  digest[j*4+2] = (uint8_t)(s[j] >> 16);
+                  digest[j*4+3] = (uint8_t)(s[j] >> 24);
+              }
+              return 0;
+          }
+
+          int tls_init(void) { return 0; }
+          struct bufferevent *tls_wrap_bev(struct event_base *b, struct bufferevent *bev) { (void)b; return bev; }
+          void tls_cleanup(void) {}
+          int tls_is_enabled(void) { return 0; }
+          void tls_log_errors(const char *ctx) { (void)ctx; }
+          int tls_load_certs_to_ctx(void *ctx) { (void)ctx; return -1; }
+          unsigned long ERR_get_error(void) { return 0; }
+          void ERR_error_string_n(unsigned long e, char *buf, size_t len) { (void)e; if (buf && len) buf[0] = '\0'; }
+
+          size_t get_encrypt_block_size(void) { return 16; }
+          size_t get_block_size(void) { return 16; }
+          int is_encoder_inited(void) { return 0; }
+          int is_decoder_inited(void) { return 0; }
+          struct frp_coder *init_main_encoder(void) { return NULL; }
+          struct frp_coder *init_main_decoder(const uint8_t *iv) { (void)iv; return NULL; }
+          struct frp_coder *new_coder(const char *t, const char *s) { (void)t; (void)s; return NULL; }
+          struct frp_coder *get_main_encoder(void) { return NULL; }
+          struct frp_coder *get_main_decoder(void) { return NULL; }
+          uint8_t *encrypt_key(const char *t, size_t tl, const char *s, uint8_t *k, size_t kl) { (void)t;(void)tl;(void)s;(void)k;(void)kl; return NULL; }
+          uint8_t *encrypt_iv(uint8_t *iv, size_t l) { (void)iv;(void)l; return NULL; }
+          size_t encrypt_data(const uint8_t *d, size_t l, struct frp_coder *e, uint8_t **r) { (void)d;(void)l;(void)e;(void)r; return 0; }
+          size_t decrypt_data(const uint8_t *d, size_t l, struct frp_coder *e, uint8_t **r) { (void)d;(void)l;(void)e;(void)r; return 0; }
+          void free_encoder(struct frp_coder *e) { (void)e; }
+          void free_crypto_resources(void) {}
+
+          int crypto_derive_key(const char *t, uint8_t *k) { (void)t;(void)k; return -1; }
+          struct crypto_ctx *crypto_ctx_new_writer(const uint8_t *k) { (void)k; return NULL; }
+          struct crypto_ctx *crypto_ctx_new_reader(const uint8_t *k) { (void)k; return NULL; }
+          void crypto_ctx_free(struct crypto_ctx *c) { (void)c; }
+          int crypto_encrypt(struct crypto_ctx *c, uint8_t *d, size_t l) { (void)c;(void)d;(void)l; return -1; }
+          int crypto_decrypt(struct crypto_ctx *c, uint8_t *d, size_t l) { (void)c;(void)d;(void)l; return -1; }
+          int crypto_get_iv(struct crypto_ctx *c, uint8_t *iv) { (void)c;(void)iv; return -1; }
+          int crypto_set_iv(struct crypto_ctx *c, const uint8_t *iv) { (void)c;(void)iv; return -1; }
+          int crypto_writer_iv_sent(struct crypto_ctx *c) { (void)c; return 1; }
+          void crypto_writer_set_iv_sent(struct crypto_ctx *c) { (void)c; }
+          int crypto_reader_iv_received(struct crypto_ctx *c) { (void)c; return 1; }
+          void crypto_reader_set_iv_received(struct crypto_ctx *c) { (void)c; }
+          int xfrpc_compress(const uint8_t *i, size_t il, uint8_t *o, size_t *ol) { (void)i;(void)il;(void)o;(void)ol; return -1; }
+          int xfrpc_decompress(const uint8_t *i, size_t il, uint8_t *o, size_t os, size_t *ol) { (void)i;(void)il;(void)o;(void)os;(void)ol; return -1; }
+          int xfrpc_snappy_frame_encode(const uint8_t *i, size_t il, int *hs, struct evbuffer *d) { (void)i;(void)il;(void)hs;(void)d; return -1; }
+          int xfrpc_snappy_frame_decode(struct evbuffer *s, struct evbuffer *d) { (void)s;(void)d; return -1; }
+
+          int aead_writer_init(struct aead_writer *w, const uint8_t k[AEAD_KEY_SIZE]) { (void)w;(void)k; return -1; }
+          void aead_writer_free(struct aead_writer *w) { (void)w; }
+          int aead_writer_seal(struct aead_writer *w, const uint8_t *p, size_t pl, uint8_t **o, size_t *ol) { (void)w;(void)p;(void)pl;(void)o;(void)ol; return -1; }
+          int aead_reader_init(struct aead_reader *r, const uint8_t k[AEAD_KEY_SIZE]) { (void)r;(void)k; return -1; }
+          void aead_reader_free(struct aead_reader *r) { (void)r; }
+          int aead_reader_feed(struct aead_reader *r, const uint8_t *c, size_t cl) { (void)r;(void)c;(void)cl; return -1; }
+          int derive_v2_control_keys(const uint8_t *t, size_t tl, const uint8_t tr[32], const char *a, uint8_t c[AEAD_KEY_SIZE], uint8_t s[AEAD_KEY_SIZE]) { (void)t;(void)tl;(void)tr;(void)a;(void)c;(void)s; return -1; }
+
+          int wire_protocol_is_v2(void) { return 0; }
+          void wire_v2_reset(void) {}
+          int wire_v2_encode_frame(uint16_t t, const uint8_t *p, uint32_t pl, uint8_t **o, size_t *ol) { (void)t;(void)p;(void)pl;(void)o;(void)ol; return -1; }
+          int wire_v2_parse_frame(const uint8_t *b, size_t l, uint16_t *t, const uint8_t **p, uint32_t *pl) { (void)b;(void)l;(void)t;(void)p;(void)pl; return -1; }
+          int wire_v2_build_client_hello_json(const char *tr, int tls, int mux, uint8_t **j, size_t *jl) { (void)tr;(void)tls;(void)mux;(void)j;(void)jl; return -1; }
+          int wire_v2_parse_server_hello_json(const uint8_t *j, size_t jl, char *a, size_t as, char *e, size_t es) { (void)j;(void)jl;(void)a;(void)as;(void)e;(void)es; return -1; }
+          void wire_v2_hash_transcript(const uint8_t *c, size_t cl, const uint8_t *s, size_t sl, uint8_t o[32]) { (void)c;(void)cl;(void)s;(void)sl; memset(o, 0, 32); }
+          int wire_v2_encode_message(enum msg_type t, const char *j, size_t jl, uint8_t **o, size_t *ol) { (void)t;(void)j;(void)jl;(void)o;(void)ol; return -1; }
+          int wire_v2_payload_to_v1(const uint8_t *p, uint32_t pl, uint8_t **v, size_t *vl) { (void)p;(void)pl;(void)v;(void)vl; return -1; }
+
+          char *oidc_fetch_token(const char *u, const char *id, const char *s, const char *a, const char *sc, const char *ca, int sk) { (void)u;(void)id;(void)s;(void)a;(void)sc;(void)ca;(void)sk; return NULL; }
+          struct bufferevent *ws_wrap_bev(struct event_base *b, struct bufferevent *r, const char *h, int p, int w) { (void)b;(void)r;(void)h;(void)p;(void)w; return NULL; }
+          void health_check_start_all(struct event_base *b, health_check_cb_t cb, void *c) { (void)b;(void)cb;(void)c; }
+          void health_check_stop_all(void) {}
+          int health_check_is_healthy(const char *n) { (void)n; return 1; }
+          int health_check_count(void) { return 0; }
+          int deflate_write(uint8_t *s, int l, uint8_t **d, int *wl, int g) { (void)s;(void)l;(void)d;(void)wl;(void)g; return -1; }
+          int inflate_read(uint8_t *s, int l, uint8_t **d, int *rl, int g) { (void)s;(void)l;(void)d;(void)rl;(void)g; return -1; }
+          void start_tcp_redir_service(struct proxy_service *p) { (void)p; }
+
+          int parse_visitor_section(const char *s, const char *n, const char *v) { (void)s;(void)n;(void)v; return 1; }
+          void init_visitors(struct event_base *b) { (void)b; }
+          void free_all_visitor_confs(void) {}
+          void free_all_visitor_instances(void) {}
+          struct visitor_conf *get_all_visitor_confs(void) { return NULL; }
+          void handle_visitor_conn_resp(const char *r, struct proxy_client *p) { (void)r;(void)p; }
+          void visitor_fallback_connect(struct event_base *b, const char *n, evutil_socket_t fd) { (void)b;(void)n;(void)fd; }
+          void xtcp_client_run(struct event_base *b, struct proxy_client *c) { (void)b;(void)c; }
+          int xtcp_client_handle_nat_hole_resp(const char *j) { (void)j; return 0; }
+          void cleanup_xtcp_clients(void) {}
+          void xtcp_visitor_run(struct event_base *b, struct visitor_instance *v, struct bufferevent *u) { (void)b;(void)v;(void)u; }
+          void init_xtcp_visitors(struct event_base *b) { (void)b; }
+          void cleanup_xtcp_stun_cache(void) {}
+          void xtcp_handle_nat_hole_resp_msg(const char *j) { (void)j; }
+
+          int quic_connect_to_server(struct event_base *b, const char *s, int p, quic_handshake_cb cb, void *a) { (void)b;(void)s;(void)p;(void)cb;(void)a; return -1; }
+          int quic_transport_available(void) { return 0; }
+          struct bufferevent *quic_open_work_stream(struct event_base *b) { (void)b; return NULL; }
+          int quic_work_stream_send_initial(const void *d, size_t l) { (void)d;(void)l; return -1; }
+          void quic_transport_reset(void) {}
+
+          int https2http_init_service(struct proxy_service *p) { (void)p; return -1; }
+          void https2http_free_service(struct proxy_service *p) { (void)p; }
+          int https2http_setup(struct proxy_client *c) { (void)c; return -1; }
+          void https2http_ssl_read_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          void https2http_local_read_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          void https2http_ssl_event_cb(struct bufferevent *b, short w, void *c) { (void)b;(void)w;(void)c; }
+          void https2http_bridge_read_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          void https2http_bridge_write_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          int https2http_bridge_drain(struct proxy_client *c) { (void)c; return 0; }
+          void https2http_trigger_shutdown(struct proxy_client *c) { (void)c; }
+          void https2http_drain_bridge(struct proxy_client *c) { (void)c; }
+          int https2http_try_finish_close(struct proxy_client *c) { (void)c; return 1; }
+          void https2http_client_cleanup(struct proxy_client *c) { (void)c; }
+
+          int is_std_plugin_proxy(const struct proxy_service *p) { (void)p; return 0; }
+          int std_plugin_setup(struct proxy_client *c) { (void)c; return -1; }
+          void std_plugin_cleanup(struct proxy_client *c) { (void)c; }
+          void start_httpd_service(struct proxy_service *p) { (void)p; }
+          int simple_telnetd_start(uint16_t p) { (void)p; return -1; }
+          int start_instaloader_service(uint16_t p) { (void)p; return -1; }
+          int start_youtubedl_service(uint16_t p) { (void)p; return -1; }
+
+          void udp_proxy_c2s_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          void udp_proxy_s2c_cb(struct bufferevent *b, void *c) { (void)b;(void)c; }
+          void process_udp_rx_buf(struct proxy_client *c) { (void)c; }
+          void process_udp_decomp_buf(struct proxy_client *c) { (void)c; }
+          void init_udp_clean_timer(struct proxy_client *c) { (void)c; }
+          void handle_udp_packet(struct udp_packet *u, struct proxy_client *c) { (void)u;(void)c; }
+          void flush_udp_dns_pending(struct proxy_client *c) { (void)c; }
+          void clear_udp_dns_pending(struct proxy_client *c) { (void)c; }
+          void udp_deliver_tail_bytes(struct proxy_client *c, const uint8_t *d, size_t l) { (void)c;(void)d;(void)l; }
+          int resolve_local_addr(const char *ip, struct sockaddr_in *a) { (void)ip;(void)a; return -1; }
+          void clear_udp_sessions(struct proxy_client *c) { (void)c; }
+          STUB_EOF
+
+                if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
+                  # 半静态链接：仅静态链接 /usr/lib/libevent.a，动态复用路由器的 musl 与 libjson-c.so.5
+                  cat > CMakeLists.txt << 'CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.5...3.27)
+          project(xfrp C)
+          include_directories(/usr/include ${CMAKE_SOURCE_DIR})
+          add_definitions(-D_GNU_SOURCE -Wall)
+          add_executable(xfrpc
+              main.c client.c config.c control.c ini.c toml_parser.c
+              vendor/tomlc17/tomlc17.c msg.c xfrpc.c debug.c commandline.c
+              utils.c common.c login.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
+          )
+          target_compile_options(xfrpc PRIVATE -Wno-stringop-truncation)
+          target_link_libraries(xfrpc PRIVATE /usr/lib/libevent.a json-c)
+          install(TARGETS xfrpc DESTINATION bin)
+          CMAKE_EOF
+
+                  cmake -B build \
+                    -DCMAKE_BUILD_TYPE=MinSizeRel \
+                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                    -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                    -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                    -DCMAKE_EXE_LINKER_FLAGS="${CFLAGS_OPT} -static-libgcc -Wl,--as-needed -Wl,--gc-sections -Wl,--build-id=none -Wl,-s"
+                else
+                  cat > CMakeLists.txt << 'CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.5...3.27)
+          project(xfrp C)
+          set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+          set(BUILD_SHARED_LIBS OFF)
+          set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules/")
+          find_package(LibEvent REQUIRED)
+          find_package(JSON-C REQUIRED)
+          include_directories(${LIBEVENT_INCLUDE_DIR} ${JSON-C_INCLUDE_DIR} ${CMAKE_SOURCE_DIR})
+          add_definitions(-D_GNU_SOURCE -Wall)
+          add_executable(xfrpc
+              main.c client.c config.c control.c ini.c toml_parser.c
+              vendor/tomlc17/tomlc17.c msg.c xfrpc.c debug.c commandline.c
+              utils.c common.c login.c proxy.c proxy_tcp.c tcpmux.c notls_stubs.c
+          )
+          target_compile_options(xfrpc PRIVATE -Wno-stringop-truncation)
+          target_link_libraries(xfrpc PRIVATE ${LIBEVENT_LIB} ${JSON-C_LIBRARIES} m pthread)
+          install(TARGETS xfrpc DESTINATION bin)
+          CMAKE_EOF
+
+                  cmake -B build \
+                    -DCMAKE_BUILD_TYPE=MinSizeRel \
+                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                    -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                    -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                    -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+                    -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none -Wl,-s"
+                fi
+              else
+                if [ "${XFRPC_TLS}" = "slim" ]; then
+                  awk '
+                    /^int https2http_init_service\(/ {
+                      print "int https2http_init_service(struct proxy_service *ps) { (void)ps; return -1; }"
+                      skip=1; next
+                    }
+                    skip && /^\}$/ { skip=0; next }
+                    !skip { print }
+                  ' plugins/https2http.c > plugins/https2http.c.tmp && mv plugins/https2http.c.tmp plugins/https2http.c
+                fi
+
+                sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
+                sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
+
+                cmake -B build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+                  -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -Wl,--gc-sections -Wl,--build-id=none -Wl,-s" \
+                  -DOPENSSL_USE_STATIC_LIBS=ON \
+                  -DUSE_WOLFSSL=OFF \
+                  -DENABLE_QUIC=OFF \
+                  -DBUILD_STATIC=ON \
+                  -DDEBUG=OFF
+              fi
+
               cmake --build build -j"$(nproc)"
 
               BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
               test -n "${BIN}"
               strip --strip-all --remove-section=.comment --remove-section=.note "${BIN}"
+
+              if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
+                echo "=== Dynamic dependencies (notls-hybrid) ==="
+                readelf -d "${BIN}" | grep NEEDED
+                ! readelf -d "${BIN}" | grep -Eq "libevent|libssl|libcrypto|libz|libgcc_s"
+              fi
+
+              # 在 musl 容器内直接采集版本号，兼容半静态与全静态模式
+              ("${BIN}" -v 2>&1 || true) | head -n 1 > /out/.ver_xfrpc
+              test -s /out/.ver_xfrpc
+
               cp "${BIN}" /out/xfrpc
               chmod 755 /out/xfrpc
-              chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
-            '
+              chown "${HOST_UID}:${HOST_GID}" /out/xfrpc /out/.ver_xfrpc
+          DOCKER_EOF
 
           file out/xfrpc
-          file out/xfrpc | grep -Eq "statically linked|static-pie linked"
-          
+          if [ "${XFRPC_TLS}" = "notls-hybrid" ]; then
+            file out/xfrpc | grep -Eq "dynamically linked"
+          else
+            file out/xfrpc | grep -Eq "statically linked|static-pie linked"
+          fi
+
       - name: Build cloudflared (arm64)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
@@ -221,10 +573,14 @@ jobs:
             ls -lh "out/$f" | awk '{print $5}' > "meta/raw_$f"
           done
 
-          # 原生 ARM64 环境直接运行校验可执行性与版本号
+          # 原生 ARM64 环境直接运行校验可执行性与版本号（xfrpc 半静态版使用 musl 容器内采集的版本号）
           ./out/xray version | sed -n '1p' > meta/ver_xray
           ./out/frpc -v > meta/ver_frpc
-          (./out/xfrpc -v 2>&1 || true) | head -n 1 > meta/ver_xfrpc
+          if [ -s out/.ver_xfrpc ]; then
+            mv out/.ver_xfrpc meta/ver_xfrpc
+          else
+            (./out/xfrpc -v 2>&1 || true) | head -n 1 > meta/ver_xfrpc
+          fi
           test -s meta/ver_xfrpc
           ./out/cloudflared -v > meta/ver_cloudflared
 
@@ -236,7 +592,7 @@ jobs:
       - name: Output Summary
         run: |
           {
-            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc TLS：\`${XFRPC_TLS}\`）"
+            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc 模式：\`${XFRPC_TLS}\`）"
             echo ""
             if [ "${USE_UPX}" = "true" ]; then
               echo "| 程序 | 压缩前 | 最终体积 | 版本校验 |"
