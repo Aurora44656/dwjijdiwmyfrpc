@@ -8,10 +8,11 @@ on:
         type: boolean
         default: false
       xfrpc_tls:
-        description: 'xfrpc 静态库编译模式（slim 源码极限裁剪 ~1.1M；alpine 预编译包编译最快 ~4.5M）'
+        description: 'xfrpc 编译模式（hybrid 半静态仅打包libevent ~330K；slim 纯静态裁剪 ~1.2M；alpine 纯静态最快 ~4.5M）'
         type: choice
-        default: slim
+        default: hybrid
         options:
+          - hybrid
           - slim
           - alpine
 
@@ -67,7 +68,7 @@ jobs:
             -ldflags="-s -w -buildid= -X github.com/fatedier/frp/pkg/util/version.version=${VER}" \
             -o ../out/frpc ./cmd/frpc
 
-      - name: Build xfrpc (arm64, musl static)
+      - name: Build xfrpc (arm64, musl)
         run: |
           mkdir -p out
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/liudf0716/xfrpc/releases/latest | jq -r .tag_name)
@@ -76,73 +77,23 @@ jobs:
           fi
           echo "Building xfrpc ${TAG} (Mode: ${XFRPC_TLS})..."
 
-          docker run --rm \
-            -v "${PWD}/out:/out" \
-            -e XFRPC_TAG="${TAG}" \
-            -e XFRPC_TLS="${XFRPC_TLS}" \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
-            alpine:3.24 sh -euxc '
-              apk add --no-cache \
-                build-base cmake pkgconfig git perl linux-headers \
-                zlib-dev zlib-static
+          if [ "${XFRPC_TLS}" = "hybrid" ]; then
+            # 半静态模式：选用与 ImmortalWrt 24.10 完美对齐的 alpine:3.21（musl 1.2.5 + json-c 0.18 + zlib 1.3.1 + libssl.so.3/libcrypto.so.3）
+            # 仅将路由器缺失的 libevent 编译为纯静态库打进 xfrpc，其余全部动态调用路由器内置 .so，单文件免 opkg 安装直跑
+            docker run --rm \
+              -v "${PWD}/out:/out" \
+              -e XFRPC_TAG="${TAG}" \
+              -e HOST_UID="$(id -u)" \
+              -e HOST_GID="$(id -g)" \
+              alpine:3.21 sh -euxc '
+                apk add --no-cache \
+                  build-base cmake pkgconfig git linux-headers \
+                  openssl-dev json-c-dev zlib-dev
 
-              CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
-              COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
+                CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -fno-stack-protector -march=armv8-a+crc+crypto -mtune=cortex-a53"
+                COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
 
-              # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + gcc-ar LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
-              git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
-              cmake -S /tmp/json-c -B /tmp/json-c/build \
-                -DCMAKE_BUILD_TYPE=MinSizeRel \
-                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-                -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_INSTALL_LIBDIR=lib \
-                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
-                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
-                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
-                -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
-                -DBUILD_SHARED_LIBS=OFF \
-                -DBUILD_STATIC_LIBS=ON \
-                -DBUILD_TESTING=OFF \
-                -DBUILD_APPS=OFF \
-                -DDISABLE_WERROR=ON \
-                -DDISABLE_EXTRA_LIBS=ON
-              cmake --build /tmp/json-c/build -j"$(nproc)"
-              cmake --install /tmp/json-c/build
-
-              # 2. xfrpc 5.x 已全量硬编码使用 OpenSSL 原生 API（USE_WOLFSSL 在非 QUIC 下已失效且会导致双库同时链接）
-              #    slim 模式：从源码编译极限裁剪的 OpenSSL 1.1.1w + libevent
-              #    注意：OpenSSL 1.1.1 的 ./Configure 会忽略环境变量 CFLAGS，必须将 CFLAGS_OPT 作为位置参数直接传在命令行末尾！
-              if [ "${XFRPC_TLS}" = "slim" ] || [ "${XFRPC_TLS}" = "wolfssl" ]; then
-                git clone --depth 1 --branch OpenSSL_1_1_1w https://github.com/openssl/openssl.git /tmp/openssl
-                cd /tmp/openssl
-                ./Configure linux-aarch64 \
-                  --prefix=/usr \
-                  --libdir=lib \
-                  --openssldir=/etc/ssl \
-                  no-shared no-dso no-engine no-async no-tests no-ui-console no-err \
-                  no-autoload-config no-autoerrinit no-tls1 no-tls1_1 no-tls1-method no-tls1_1-method \
-                  no-aria no-bf no-blake2 no-camellia no-cast no-cmac no-cms no-comp \
-                  no-ct no-des no-dh no-dsa no-dtls no-ec2m no-filenames no-gost \
-                  no-heartbeats no-idea no-md2 no-md4 no-mdc2 no-multiblock \
-                  no-nextprotoneg no-ocb no-ocsp no-psk no-rc2 no-rc4 no-rc5 no-rdrand \
-                  no-rfc3779 no-rmd160 no-scrypt no-seed no-siphash no-sm2 no-sm3 \
-                  no-sm4 no-srp no-srtp no-ssl3 no-ts no-whirlpool \
-                  ${CFLAGS_OPT} ${COMPAT_CFLAGS}
-
-                # 剔除 Makefile 中的 -O3 与 187KB 的 P-256 巨型预计算表 (ECP_NISTZ256_ASM)，并校验 section GC 标志已生效
-                sed -i "s/-O3/-Os/g; s/-DECP_NISTZ256_ASM//g" Makefile
-                grep -q -- "-ffunction-sections" Makefile
-
-                # 从全局注册表中剔除 Curve448(X448/Ed448 210KB 预计算表，注意 ASN.1 表位于 standard_methods.h)、SHA-3/Keccak1600 及冷门 AES 模式
-                sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
-                ! grep -Eq "ecx448_|ed448_" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
-                sed -i "/EVP_sha3_/d; /EVP_shake/d; /EVP_sha512_/d" crypto/evp/c_alld.c
-                sed -i "/_cbc_hmac_/d; /_ccm/d; /_xts/d; /_wrap/d; /_cfb1(/d; /_cfb8(/d; /_ofb/d; /_ecb/d; /aes_192/d" crypto/evp/c_allc.c
-
-                make -j"$(nproc)" build_libs AR="gcc-ar" RANLIB="gcc-ranlib"
-                make install_dev
-
+                # 1. 仅构建纯静态 libevent.a + libevent_openssl.a（不生成任何 .so，确保 CMake 100% 静态嵌入 libevent）
                 git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
                 cmake -S /tmp/libevent -B /tmp/libevent/build \
                   -DCMAKE_BUILD_TYPE=MinSizeRel \
@@ -159,47 +110,172 @@ jobs:
                   -DEVENT__DISABLE_REGRESS=ON \
                   -DEVENT__DISABLE_SAMPLES=ON \
                   -DEVENT__DISABLE_BENCHMARK=ON \
-                  -DOPENSSL_USE_STATIC_LIBS=ON
+                  -DOPENSSL_USE_STATIC_LIBS=OFF
                 cmake --build /tmp/libevent/build -j"$(nproc)"
                 cmake --install /tmp/libevent/build
-              else
+                ! ls /usr/lib/libevent*.so* >/dev/null 2>&1
+
+                # 2. 半静态编译 xfrpc：libevent 静态内嵌，OpenSSL / json-c / zlib / musl 动态链接
+                git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
+                cd /tmp/xfrpc
+                sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
+                sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
+
+                cmake -B build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                  -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DCMAKE_EXE_LINKER_FLAGS="${CFLAGS_OPT} -fuse-linker-plugin -static-libgcc -Wl,--as-needed -Wl,--gc-sections -Wl,-s" \
+                  -DOPENSSL_USE_STATIC_LIBS=OFF \
+                  -DUSE_WOLFSSL=OFF \
+                  -DENABLE_QUIC=OFF \
+                  -DBUILD_STATIC=OFF \
+                  -DDEBUG=OFF
+                cmake --build build -j"$(nproc)"
+
+                BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
+                test -n "${BIN}"
+                strip --strip-all --remove-section=.comment --remove-section=.note "${BIN}"
+
+                # 3. ABI 安全门禁：
+                #    (a) 校验 NEEDED 仅包含路由器已内置的 5 个 .so（严禁出现 libevent*.so 或 libgcc_s.so）
+                readelf -d "${BIN}" | grep "(NEEDED)"
+                ! (readelf -d "${BIN}" | grep "(NEEDED)" | grep -Ev "\[lib(ssl\.so\.3|crypto\.so\.3|json-c\.so\.5|z\.so\.1|c\.musl-aarch64\.so\.1|c\.so)\]")
+                #    (b) 校验未引用任何 OpenSSL 3.1+ 新增符号（100% 兼容路由器内置的 OpenSSL 3.0.16）
+                ! (readelf -V "${BIN}" | grep -E "OPENSSL_3\.[1-9]")
+
+                cp "${BIN}" /out/xfrpc
+                chmod 755 /out/xfrpc
+                chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
+              '
+
+            file out/xfrpc
+            file out/xfrpc | grep -q "interpreter /lib/ld-musl-aarch64.so.1"
+          else
+            docker run --rm \
+              -v "${PWD}/out:/out" \
+              -e XFRPC_TAG="${TAG}" \
+              -e XFRPC_TLS="${XFRPC_TLS}" \
+              -e HOST_UID="$(id -u)" \
+              -e HOST_GID="$(id -g)" \
+              alpine:3.24 sh -euxc '
                 apk add --no-cache \
-                  libevent-dev libevent-static \
-                  openssl-dev openssl-libs-static
-              fi
+                  build-base cmake pkgconfig git perl linux-headers \
+                  zlib-dev zlib-static
 
-              # 3. 编译 xfrpc：修正 CMakeLists.txt 强制追加 -O2/-Werror 及静态库依赖顺序倒置问题，启用全程序 LTO + --gc-sections
-              git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
-              cd /tmp/xfrpc
-              sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
-              sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
+                CFLAGS_OPT="-Os -ffunction-sections -fdata-sections -flto=auto -ffat-lto-objects -march=armv8-a+crc+crypto -mtune=cortex-a53"
+                COMPAT_CFLAGS="-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=strict-prototypes"
 
-              cmake -B build \
-                -DCMAKE_BUILD_TYPE=MinSizeRel \
-                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-                -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
-                -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
-                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
-                -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
-                -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static ${CFLAGS_OPT} -fuse-linker-plugin -Wl,--gc-sections -Wl,-s" \
-                -DOPENSSL_USE_STATIC_LIBS=ON \
-                -DUSE_WOLFSSL=OFF \
-                -DENABLE_QUIC=OFF \
-                -DBUILD_STATIC=ON \
-                -DDEBUG=OFF
-              cmake --build build -j"$(nproc)"
+                # 1. 编译纯静态 libjson-c.a（使用 MinSizeRel + gcc-ar LTO 防止 CMake 默认 Release 的 -O3 覆盖 -Os）
+                git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
+                cmake -S /tmp/json-c -B /tmp/json-c/build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_INSTALL_PREFIX=/usr \
+                  -DCMAKE_INSTALL_LIBDIR=lib \
+                  -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                  -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DBUILD_SHARED_LIBS=OFF \
+                  -DBUILD_STATIC_LIBS=ON \
+                  -DBUILD_TESTING=OFF \
+                  -DBUILD_APPS=OFF \
+                  -DDISABLE_WERROR=ON \
+                  -DDISABLE_EXTRA_LIBS=ON
+                cmake --build /tmp/json-c/build -j"$(nproc)"
+                cmake --install /tmp/json-c/build
 
-              BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
-              test -n "${BIN}"
-              strip --strip-all --remove-section=.comment --remove-section=.note "${BIN}"
-              cp "${BIN}" /out/xfrpc
-              chmod 755 /out/xfrpc
-              chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
-            '
+                # 2. slim 模式：从源码编译极限裁剪的 OpenSSL 1.1.1w + libevent
+                if [ "${XFRPC_TLS}" = "slim" ] || [ "${XFRPC_TLS}" = "wolfssl" ]; then
+                  git clone --depth 1 --branch OpenSSL_1_1_1w https://github.com/openssl/openssl.git /tmp/openssl
+                  cd /tmp/openssl
+                  ./Configure linux-aarch64 \
+                    --prefix=/usr \
+                    --libdir=lib \
+                    --openssldir=/etc/ssl \
+                    no-shared no-dso no-engine no-async no-tests no-ui-console no-err \
+                    no-autoload-config no-autoerrinit no-tls1 no-tls1_1 no-tls1-method no-tls1_1-method \
+                    no-aria no-bf no-blake2 no-camellia no-cast no-cmac no-cms no-comp \
+                    no-ct no-des no-dh no-dsa no-dtls no-ec2m no-filenames no-gost \
+                    no-heartbeats no-idea no-md2 no-md4 no-mdc2 no-multiblock \
+                    no-nextprotoneg no-ocb no-ocsp no-psk no-rc2 no-rc4 no-rc5 no-rdrand \
+                    no-rfc3779 no-rmd160 no-scrypt no-seed no-siphash no-sm2 no-sm3 \
+                    no-sm4 no-srp no-srtp no-ssl3 no-ts no-whirlpool \
+                    ${CFLAGS_OPT} ${COMPAT_CFLAGS}
 
-          file out/xfrpc
-          file out/xfrpc | grep -Eq "statically linked|static-pie linked"
+                  sed -i "s/-O3/-Os/g; s/-DECP_NISTZ256_ASM//g" Makefile
+                  grep -q -- "-ffunction-sections" Makefile
+
+                  sed -i "/ecx448_/d; /ed448_/d" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
+                  ! grep -Eq "ecx448_|ed448_" crypto/asn1/standard_methods.h crypto/evp/pmeth_lib.c
+                  sed -i "/EVP_sha3_/d; /EVP_shake/d; /EVP_sha512_/d" crypto/evp/c_alld.c
+                  sed -i "/_cbc_hmac_/d; /_ccm/d; /_xts/d; /_wrap/d; /_cfb1(/d; /_cfb8(/d; /_ofb/d; /_ecb/d; /aes_192/d" crypto/evp/c_allc.c
+
+                  make -j"$(nproc)" build_libs AR="gcc-ar" RANLIB="gcc-ranlib"
+                  make install_dev
+
+                  git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
+                  cmake -S /tmp/libevent -B /tmp/libevent/build \
+                    -DCMAKE_BUILD_TYPE=MinSizeRel \
+                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                    -DCMAKE_INSTALL_PREFIX=/usr \
+                    -DCMAKE_INSTALL_LIBDIR=lib \
+                    -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                    -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
+                    -DCMAKE_C_FLAGS="${CFLAGS_OPT} ${COMPAT_CFLAGS}" \
+                    -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                    -DEVENT__LIBRARY_TYPE=STATIC \
+                    -DEVENT__DISABLE_DEBUG_MODE=ON \
+                    -DEVENT__DISABLE_TESTS=ON \
+                    -DEVENT__DISABLE_REGRESS=ON \
+                    -DEVENT__DISABLE_SAMPLES=ON \
+                    -DEVENT__DISABLE_BENCHMARK=ON \
+                    -DOPENSSL_USE_STATIC_LIBS=ON
+                  cmake --build /tmp/libevent/build -j"$(nproc)"
+                  cmake --install /tmp/libevent/build
+                else
+                  apk add --no-cache \
+                    libevent-dev libevent-static \
+                    openssl-dev openssl-libs-static
+                fi
+
+                # 3. 编译纯静态 xfrpc
+                git clone --depth 1 --branch "${XFRPC_TAG}" --recurse-submodules https://github.com/liudf0716/xfrpc.git /tmp/xfrpc
+                cd /tmp/xfrpc
+                sed -i "s/-O2/-Os/g; /-Werror/d" CMakeLists.txt
+                sed -i "/EXTERNAL_LIBS/,/)/ { /SSL_LIBRARIES/d; s/LIBEVENT_LIB}/LIBEVENT_LIB} \${SSL_LIBRARIES}/; }" CMakeLists.txt
+
+                cmake -B build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                  -DCMAKE_C_COMPILER_AR=/usr/bin/gcc-ar \
+                  -DCMAKE_C_COMPILER_RANLIB=/usr/bin/gcc-ranlib \
+                  -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG" \
+                  -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+                  -DCMAKE_EXE_LINKER_FLAGS="-static -no-pie ${CFLAGS_OPT} -fuse-linker-plugin -Wl,--gc-sections -Wl,-s" \
+                  -DOPENSSL_USE_STATIC_LIBS=ON \
+                  -DUSE_WOLFSSL=OFF \
+                  -DENABLE_QUIC=OFF \
+                  -DBUILD_STATIC=ON \
+                  -DDEBUG=OFF
+                cmake --build build -j"$(nproc)"
+
+                BIN=$(find build -maxdepth 3 -type f -name xfrpc -perm -100 | head -n 1)
+                test -n "${BIN}"
+                strip --strip-all --remove-section=.comment --remove-section=.note "${BIN}"
+                cp "${BIN}" /out/xfrpc
+                chmod 755 /out/xfrpc
+                chown "${HOST_UID}:${HOST_GID}" /out/xfrpc
+              '
+
+            file out/xfrpc
+            file out/xfrpc | grep -Eq "statically linked|static-pie linked"
+          fi
           
       - name: Build cloudflared (arm64)
         run: |
@@ -224,19 +300,34 @@ jobs:
           # 原生 ARM64 环境直接运行校验可执行性与版本号
           ./out/xray version | sed -n '1p' > meta/ver_xray
           ./out/frpc -v > meta/ver_frpc
-          (./out/xfrpc -v 2>&1 || true) | head -n 1 > meta/ver_xfrpc
+          if [ "${XFRPC_TLS}" = "hybrid" ]; then
+            # 在模拟 ImmortalWrt 的纯净容器环境（仅装 openssl/json-c/zlib，不装 libevent）实测运行校验
+            docker run --rm -v "${PWD}/out:/out:ro" alpine:3.21 sh -c '
+              apk add --no-cache libssl3 libcrypto3 json-c zlib >/dev/null
+              (/out/xfrpc -v 2>&1 || true) | head -n 1
+            ' > meta/ver_xfrpc
+          else
+            (./out/xfrpc -v 2>&1 || true) | head -n 1 > meta/ver_xfrpc
+          fi
           test -s meta/ver_xfrpc
+          grep -q "version:" meta/ver_xfrpc
           ./out/cloudflared -v > meta/ver_cloudflared
 
           if [ "${USE_UPX}" = "true" ]; then
-            upx --best --lzma out/xray out/frpc out/xfrpc out/cloudflared
-            upx -t out/xray out/frpc out/xfrpc out/cloudflared
+            if [ "${XFRPC_TLS}" = "hybrid" ]; then
+              # 动态链接 musl 程序不可经 UPX 加壳（会破坏 ld-musl 段映射导致段错误），且半静态 xfrpc 仅 ~330KB 无需 UPX
+              upx --best --lzma out/xray out/frpc out/cloudflared
+              upx -t out/xray out/frpc out/cloudflared
+            else
+              upx --best --lzma out/xray out/frpc out/xfrpc out/cloudflared
+              upx -t out/xray out/frpc out/xfrpc out/cloudflared
+            fi
           fi
 
       - name: Output Summary
         run: |
           {
-            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc TLS：\`${XFRPC_TLS}\`）"
+            echo "### 编译结果（Runner：\`ubuntu-24.04-arm\` ｜ UPX：\`${USE_UPX}\` ｜ xfrpc 模式：\`${XFRPC_TLS}\`）"
             echo ""
             if [ "${USE_UPX}" = "true" ]; then
               echo "| 程序 | 压缩前 | 最终体积 | 版本校验 |"
