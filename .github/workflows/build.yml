@@ -93,11 +93,25 @@ jobs:
               apk add --no-cache \
                 build-base cmake pkgconfig git linux-headers \
                 zlib-dev zlib-static \
-                json-c-dev json-c-static \
                 libevent-dev libevent-static \
                 openssl-dev openssl-libs-static
 
               CFLAGS_OPT="-Os -march=armv8-a+crc+crypto -mtune=cortex-a53"
+
+              # Alpine 官方源无 json-c-static，从源码编译纯静态 libjson-c.a
+              git clone --depth 1 --branch json-c-0.18-20240915 https://github.com/json-c/json-c.git /tmp/json-c
+              cmake -S /tmp/json-c -B /tmp/json-c/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DBUILD_STATIC_LIBS=ON \
+                -DBUILD_TESTING=OFF \
+                -DDISABLE_EXTRA_LIBS=ON
+              cmake --build /tmp/json-c/build -j"$(nproc)"
+              cmake --install /tmp/json-c/build
 
               if [ "${XFRPC_TLS}" = "wolfssl" ]; then
                 apk add --no-cache autoconf automake libtool
@@ -120,6 +134,7 @@ jobs:
               cd /tmp/xfrpc
               cmake -B build \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_C_FLAGS="${CFLAGS_OPT}" \
                 -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
                 -DCMAKE_EXE_LINKER_FLAGS="-static" \
@@ -140,7 +155,7 @@ jobs:
 
           file out/xfrpc
           file out/xfrpc | grep -q "statically linked"
-
+          
       - name: Build cloudflared (arm64)
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
