@@ -155,7 +155,7 @@ jobs:
             '
 
           file out/xfrpc
-          file out/xfrpc | grep -q "statically linked"
+          file out/xfrpc | grep -Eq "statically linked|static-pie linked"
           
       - name: Build cloudflared (arm64)
         run: |
